@@ -26,6 +26,44 @@ roslaunch uav_delivery delivery.launch rviz:=true
 
 ---
 
+## Requirements and install
+
+Ubuntu 20.04, **ROS Noetic** and Gazebo 11. hector_quadrotor and the packages around it are not released as Noetic debs, so the workspace is a source build:
+
+```bash
+mkdir -p ~/uav_ws/src && cd ~/uav_ws/src
+git clone https://github.com/ros-geographic-info/unique_identifier.git
+git clone https://github.com/ros-geographic-info/geographic_info.git
+git clone https://github.com/RAFALAMAO/hector-quadrotor-noetic.git
+git clone https://github.com/pal-robotics/gazebo_ros_link_attacher.git
+git clone https://github.com/JaberValizadeh/uav_delivery.git
+
+cd ~/uav_ws
+rosdep install --from-paths src --ignore-src -r -y
+catkin_make --pkg uuid_msgs unique_id geographic_msgs geodesy
+catkin_make
+```
+
+The two-stage build is not optional. `hector_pose_estimation_core` includes `geographic_msgs` headers without declaring a dependency on the target that generates them, so a single parallel build races and fails on the first pass.
+
+### Environment
+
+The commands in this README source `~/uav_ws/src/uav_pick_place/setup_uav.bash` from the author's workspace. That package is not published; if you do not have it, this is the equivalent, in every terminal:
+
+```bash
+source /opt/ros/noetic/setup.bash
+source ~/uav_ws/devel/setup.bash
+
+# hector's Gazebo plugins and the link attacher (the gripper)
+export GAZEBO_PLUGIN_PATH=$HOME/uav_ws/devel/lib:${GAZEBO_PLUGIN_PATH:-}
+# the quadrotor meshes, for package:// URIs in the URDF
+export GAZEBO_MODEL_PATH=$HOME/uav_ws/src/hector-quadrotor-noetic:${GAZEBO_MODEL_PATH:-}
+```
+
+Without `GAZEBO_PLUGIN_PATH` the link attacher never loads, `/link_attacher_node/attach` never appears, and the couriers refuse to grasp.
+
+---
+
 ## One box, one drone
 
 That guarantee lives in one field — `Parcel.carrier` — and in the rule that the
@@ -725,7 +763,7 @@ controller that is told what it is holding.
 This package lives in `~/uav_ws` alongside hector, `gazebo_ros_link_attacher`
 and the other UAV packages, so nothing extra is needed to build it. If the
 workspace is not built yet, see
-[uav_pick_place's README](../uav_pick_place/README.md#installing-the-dependencies)
+[Requirements and install](#requirements-and-install)
 — none of the third-party trees are packaged for Noetic and the build is
 two-stage.
 
@@ -741,9 +779,9 @@ so and refuse to grasp anything.
 
 ## Related packages
 
-* [`uav_pick_place`](../uav_pick_place) — one drone, a fixed list of blocks and
+* `uav_pick_place` — one drone, a fixed list of blocks and
   pads. Where the gripper and the payload-inertia limit come from.
-* [`uav_bushfire`](../uav_bushfire) — three drones, shared ground targets,
+* [`uav_bushfire`](https://github.com/JaberValizadeh/uav_bushfire) — three drones, shared ground targets,
   central tasking. Where the flying comes from.
-* [`uav_voice_control`](../uav_voice_control) — the pick-and-place mission,
+* `uav_voice_control` — the pick-and-place mission,
   flown by talking to it.
