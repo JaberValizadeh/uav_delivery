@@ -1,0 +1,215 @@
+<?xml version="1.0"?>
+<!-- The delivery area: a 32 x 32 m walled yard with a small warehouse in one
+     corner and eight crate stacks scattered through it.
+
+     Hub and spoke, laid out the way a real one is. The warehouse is a 2.4 m
+     loading apron in the far south-west corner, deliberately small and
+     deliberately nowhere near the customers: every job is therefore a genuine
+     transit of at least 9 m and up to about 35 m, out across the yard and back
+     empty. An operation whose depot sits in the middle of its own customers is
+     not really a distribution problem.
+
+     The customers are NOT in this file. Their addresses are drawn at random
+     inside the yard on every re-issue and the dispatcher spawns a doorstep
+     marker for each one at runtime, so no two runs deliver to the same set of
+     places and a reader cannot check the drone's work against the source.
+     Addresses are named by grid reference - 3.2 m cells, lettered A to J west
+     to east and numbered 1 to 10 south to north - which is derived from the
+     position rather than stored beside it, so the name and the place can never
+     disagree.
+
+     The apron is a marking, not a building, and that is deliberate: a
+     structure would put a roof over the one place all three aircraft descend
+     into on every single job, and the hub would become airspace they cannot
+     use. A flat apron is what a forecourt loading zone actually looks like,
+     and there is nothing else in the corner - an obstacle beside the one place
+     every aircraft has to descend into buys nothing but rescues.
+
+     The crates are 3 m tall against transit altitudes of 1.2, 1.9 and 2.6 m,
+     so no aircraft on any layer can climb over one and every one of them has
+     to use its laser. They are spread through the customer area rather than
+     ringed around the hub, because that is where the flying now happens.
+
+     The walls are 3 m, so a drone at transit altitude cannot leave the yard.
+     They are the backstop behind the courier's geofence, not the primary
+     containment.
+
+     The one plugin that matters is gazebo_ros_link_attacher, loaded below as a
+     world plugin. It serves /link_attacher_node/attach and /detach, which weld
+     and unweld two links with a fixed joint - that is the drones' gripper. It
+     is built in ~/uav_ws, so gzserver only finds it if GAZEBO_PLUGIN_PATH
+     includes ~/uav_ws/devel/lib; setup_uav.bash does that, and the courier
+     says so precisely if the services never turn up. -->
+<sdf version="1.6">
+  <world name="default">
+
+    <include><uri>model://sun</uri></include>
+    <include><uri>model://ground_plane</uri></include>
+
+    <plugin name="ros_link_attacher_plugin" filename="libgazebo_ros_link_attacher.so" />
+
+    <scene>
+      <ambient>0.65 0.65 0.65 1</ambient>
+      <background>0.7 0.8 0.9 1</background>
+      <shadows>false</shadows>
+    </scene>
+
+    <physics type="ode">
+      <max_step_size>0.001</max_step_size>
+      <real_time_update_rate>1000</real_time_update_rate>
+    </physics>
+
+    <!-- ============================ warehouse ==============================
+         2.4 m square, in the corner. Small on purpose: it holds the parcels
+         waiting to go out and nothing else, and every square metre of it is
+         airspace that three aircraft have to share. -->
+    <model name="warehouse_apron">
+      <static>true</static><pose>-12.5 -12.5 0.001 0 0 0</pose>
+      <link name="link"><visual name="v">
+        <geometry><box><size>2.4 2.4 0.002</size></box></geometry>
+        <material><ambient>0.16 0.16 0.19 1</ambient><diffuse>0.30 0.32 0.36 1</diffuse>
+          <emissive>0.09 0.09 0.11 1</emissive></material></visual></link>
+    </model>
+
+    <model name="warehouse_edge_n">
+      <static>true</static><pose>-12.5 -11.35 0.0015 0 0 0</pose>
+      <link name="link"><visual name="v">
+        <geometry><box><size>2.4 0.12 0.002</size></box></geometry>
+        <material><ambient>0.35 0.30 0.05 1</ambient><diffuse>0.95 0.80 0.10 1</diffuse>
+          <emissive>0.25 0.21 0.03 1</emissive></material></visual></link>
+    </model>
+    <model name="warehouse_edge_s">
+      <static>true</static><pose>-12.5 -13.65 0.0015 0 0 0</pose>
+      <link name="link"><visual name="v">
+        <geometry><box><size>2.4 0.12 0.002</size></box></geometry>
+        <material><ambient>0.35 0.30 0.05 1</ambient><diffuse>0.95 0.80 0.10 1</diffuse>
+          <emissive>0.25 0.21 0.03 1</emissive></material></visual></link>
+    </model>
+    <model name="warehouse_edge_e">
+      <static>true</static><pose>-11.35 -12.5 0.0015 0 0 0</pose>
+      <link name="link"><visual name="v">
+        <geometry><box><size>0.12 2.64 0.002</size></box></geometry>
+        <material><ambient>0.35 0.30 0.05 1</ambient><diffuse>0.95 0.80 0.10 1</diffuse>
+          <emissive>0.25 0.21 0.03 1</emissive></material></visual></link>
+    </model>
+    <model name="warehouse_edge_w">
+      <static>true</static><pose>-13.65 -12.5 0.0015 0 0 0</pose>
+      <link name="link"><visual name="v">
+        <geometry><box><size>0.12 2.64 0.002</size></box></geometry>
+        <material><ambient>0.35 0.30 0.05 1</ambient><diffuse>0.95 0.80 0.10 1</diffuse>
+          <emissive>0.25 0.21 0.03 1</emissive></material></visual></link>
+    </model>
+
+
+    <!-- ============================== crates ==============================
+         Spread through the customer area, which is where the flying is now.
+         3 m tall, so no transit layer clears them. -->
+
+    <model name="crates_a">
+      <static>true</static><pose>5 5 1.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>1.0 1.0 3.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>1.0 1.0 3.0</size></box></geometry>
+          <material><ambient>0.30 0.22 0.12 1</ambient><diffuse>0.58 0.42 0.22 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="crates_b">
+      <static>true</static><pose>-5 5 1.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>1.0 1.0 3.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>1.0 1.0 3.0</size></box></geometry>
+          <material><ambient>0.30 0.22 0.12 1</ambient><diffuse>0.58 0.42 0.22 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="crates_c">
+      <static>true</static><pose>5 -5 1.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>1.0 1.0 3.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>1.0 1.0 3.0</size></box></geometry>
+          <material><ambient>0.30 0.22 0.12 1</ambient><diffuse>0.58 0.42 0.22 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="crates_d">
+      <static>true</static><pose>-5 -5 1.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>1.0 1.0 3.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>1.0 1.0 3.0</size></box></geometry>
+          <material><ambient>0.30 0.22 0.12 1</ambient><diffuse>0.58 0.42 0.22 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="crates_e">
+      <static>true</static><pose>10 0 1.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>1.0 1.0 3.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>1.0 1.0 3.0</size></box></geometry>
+          <material><ambient>0.26 0.26 0.30 1</ambient><diffuse>0.48 0.48 0.55 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="crates_f">
+      <static>true</static><pose>-10 0 1.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>1.0 1.0 3.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>1.0 1.0 3.0</size></box></geometry>
+          <material><ambient>0.26 0.26 0.30 1</ambient><diffuse>0.48 0.48 0.55 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="crates_g">
+      <static>true</static><pose>0 10 1.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>1.0 1.0 3.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>1.0 1.0 3.0</size></box></geometry>
+          <material><ambient>0.26 0.26 0.30 1</ambient><diffuse>0.48 0.48 0.55 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="crates_h">
+      <static>true</static><pose>0 -10 1.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>1.0 1.0 3.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>1.0 1.0 3.0</size></box></geometry>
+          <material><ambient>0.26 0.26 0.30 1</ambient><diffuse>0.48 0.48 0.55 1</diffuse></material></visual>
+      </link>
+    </model>
+
+    <!-- =============================== walls =============================== -->
+
+    <model name="wall_north">
+      <static>true</static><pose>0 16 1.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>32.2 0.2 3.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>32.2 0.2 3.0</size></box></geometry>
+          <material><ambient>0.30 0.30 0.32 1</ambient><diffuse>0.50 0.50 0.54 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="wall_south">
+      <static>true</static><pose>0 -16 1.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>32.2 0.2 3.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>32.2 0.2 3.0</size></box></geometry>
+          <material><ambient>0.30 0.30 0.32 1</ambient><diffuse>0.50 0.50 0.54 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="wall_east">
+      <static>true</static><pose>16 0 1.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.2 32.2 3.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.2 32.2 3.0</size></box></geometry>
+          <material><ambient>0.30 0.30 0.32 1</ambient><diffuse>0.50 0.50 0.54 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="wall_west">
+      <static>true</static><pose>-16 0 1.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.2 32.2 3.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.2 32.2 3.0</size></box></geometry>
+          <material><ambient>0.30 0.30 0.32 1</ambient><diffuse>0.50 0.50 0.54 1</diffuse></material></visual>
+      </link>
+    </model>
+
+    <gui>
+      <camera name="user_camera">
+        <pose>-26 -26 20 0 0.5 0.785</pose>
+      </camera>
+    </gui>
+
+  </world>
+</sdf>

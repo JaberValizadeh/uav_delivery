@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""
+pose_delivery_monitor - passive observer for one courier.
+
+It commands nothing and decides nothing. It exists so there is a record of
+where an aircraft was and what it was carrying that does not depend on three
+interleaved scoreboards staying on screen.
+
+Subscriptions
+-------------
+  ground_truth/state    nav_msgs/Odometry
+  delivery/task         uav_delivery/Parcel        this drone's job
+  /delivery/parcels     uav_delivery/ParcelArray   the whole board
+
+ROS Parameters (private, ~)
+---------------------------
+  ~pose_log_hz   float  Rate at which pose is printed (default 0.5 Hz)
+"""
+
+import math
+import sys
+
+import rospy
+
+from nav_msgs.msg import Odometry
+from tf.transformations import euler_from_quaternion
+
+from uav_delivery.msg import Parcel, ParcelArray
+
+# See the note in scripts/dispatcher: roslaunch pipes a node's output and
+# Python block-buffers into a pipe. rospy puts WARN and ERROR on stderr, which
+# on Python 3.8 buffers the same way, so without this the warnings that matter
+# most - rescues, given-up parcels - arrive late or not at all.
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
+_STATE_NAME = {
+    Parcel.WAITING: 'waiting',
+    Parcel.CLAIMED: 'claimed',
+    Parcel.CARRIED: 'carried',
+    Parcel.DELIVERED: 'delivered',
+}
+
+
+class PoseDeliveryMonitor:
+
+    def __init__(self):
+        rospy.init_node('pose_delivery_monitor', anonymous=False)
+
+        self._ns = rospy.get_namespace().strip('/') or 'uav'
+        self._log_hz = rospy.get_param('~pose_log_hz', 0.5)
+        self._last_log = rospy.Time(0)
+
+        self._parcel = None
+        self._waiting = 0
+        self._in_transit = 0
+        self._delivered = 0
+
+        rospy.Subscriber('ground_truth/state', Odometry, self._odom_cb)
+        rospy.Subscriber('delivery/task', Parcel, self._task_cb)
+        rospy.Subscriber('/delivery/parcels', ParcelArray, self._board_cb)
+
+        rospy.loginfo('[MONITOR %s] started, logging pose at %.1f Hz',
+                      self._ns, self._log_hz)
+
+    def _odom_cb(self, msg):
+        now = rospy.Time.now()
+        if (now - self._last_log).to_sec() < 1.0 / max(self._log_hz, 1e-6):
+            return
+        self._last_log = now
+
+        p = msg.pose.pose.position
+        q = msg.pose.pose.orientation
+        _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+        v = msg.twist.twist.linear
+        speed = math.sqrt(v.x ** 2 + v.y ** 2 + v.z ** 2)
+
+        if self._parcel is None:
+            rospy.loginfo('[MONITOR %s] pos=(%.2f, %.2f, %.2f) yaw=%.1f deg '
+                          'speed=%.2f m/s | no job | board: %d waiting, '
+                          '%d in transit',
+                          self._ns, p.x, p.y, p.z, math.degrees(yaw), speed,
+                          self._waiting, self._in_transit)
+            return
+
+        j = self._parcel
+        # Which end of the job the drone is working decides which distance is
+        # worth printing: before the pickup the interesting number is how far
+        # it is from the box, after it how far from the address.
+        if j.state == Parcel.CARRIED:
+            leg, gx, gy = 'to %s' % j.dst_name, j.dst_x, j.dst_y
+        else:
+            leg, gx, gy = 'to %s' % j.src_name, j.src_x, j.src_y
+        rospy.loginfo('[MONITOR %s] pos=(%.2f, %.2f, %.2f) yaw=%.1f deg '
+                      'speed=%.2f m/s | parcel %d %s>%s %s (%s) dist=%.2f m '
+                      '| delivered %d',
+                      self._ns, p.x, p.y, p.z, math.degrees(yaw), speed,
+                      j.id, j.src_name, j.dst_name, leg,
+                      _STATE_NAME.get(j.state, '?'),
+                      math.hypot(gx - p.x, gy - p.y), self._delivered)
+
+    def _task_cb(self, msg):
+        if msg.state == Parcel.DELIVERED:
+            self._delivered += 1
+            rospy.loginfo('[MONITOR %s] DELIVERED parcel %d  %s -> %s '
+                          '(%d total)', self._ns, msg.id, msg.src_name,
+                          msg.dst_name, self._delivered)
+            self._parcel = None
+            return
+        self._parcel = msg
+
+    def _board_cb(self, msg):
+        self._waiting = sum(1 for p in msg.parcels if p.state == Parcel.WAITING)
+        self._in_transit = sum(1 for p in msg.parcels
+                               if p.state in (Parcel.CLAIMED, Parcel.CARRIED))
+
+
+def main():
+    PoseDeliveryMonitor()
+    rospy.spin()
+
+
+if __name__ == '__main__':
+    main()

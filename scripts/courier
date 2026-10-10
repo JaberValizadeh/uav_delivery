@@ -1,0 +1,1358 @@
+#!/usr/bin/env python3
+"""
+courier - autonomous parcel collection and delivery for one drone.
+
+Flies the aircraft to the box it has been assigned, descends onto it, welds it
+on, carries it across the yard, sets it down on the destination depot and
+climbs away. The flying is the reactive laser controller from uav_bushfire,
+largely unchanged and for the same reasons; what is new is that the job has two
+ends.
+
+Algorithm
+---------
+  TAKEOFF - engage the motors and climb to cruise_altitude. Nothing else can
+            happen until the aircraft is airborne.
+  ALIGN   - yaw in place until the drone is facing the leg's goal.
+  CHASE   - fly forward along the current heading at cruise altitude, with
+            proportional yaw correction. Speed scales down inside slow_dist
+            and again near obstacles.
+  DESCEND - overhead the goal: stop flying forward, hold station over it and
+            come down to the working altitude.
+  ACT     - GRASP on the pickup leg, RELEASE on the delivery leg.
+  CLIMB   - back to cruise altitude before going anywhere.
+  IDLE    - airborne with no job, holding position.
+
+One task, two legs
+------------------
+Everything above runs twice per parcel. A fire or a treasure is one place the
+aircraft has to reach; a parcel is two, in order, and the second only becomes
+reachable by doing something at the first. So the state machine carries a leg
+alongside its phase - PICKUP, then DELIVERY - and ALIGN/CHASE/DESCEND/ACT are
+the same code pointed at a different goal with a different action at the
+bottom. The alternative, a phase per leg, doubles the machine to say the same
+thing twice.
+
+The two legs are not symmetrical in one respect, and it is the respect that
+bites: on the pickup leg the drone is empty and the thing it is descending onto
+is loose, so a sloppy approach knocks the box away; on the delivery leg it is
+carrying 0.04 kg of unmodelled inertia, so the same approach is flown by a
+slightly different aircraft than the one the gains were tuned for.
+
+Why the descent is a separate phase
+-----------------------------------
+The pickup and delivery points are on the ground and cannot be flown to - the
+aircraft would have to land on them. So arrival and action come apart: CHASE
+ends *overhead* at cruise, and then the drone has to get down through the last
+metre onto something it is directly above.
+
+That descent cannot be flown body-forward the way CHASE is, because "forward"
+is not a useful direction when the error is 3 cm on an arbitrary bearing and
+the drone is not yawing any more. DESCEND rotates the world-frame position
+error into the body frame and commands both linear.x and linear.y, which is
+proper station-keeping. It is the one place this node uses lateral velocity,
+and translating sideways is exactly what makes the laser's sectors meaningless,
+which is why CHASE never does it.
+
+The descent is also gated, which the bushfire version did not need to be. A
+water drop is over when the aircraft is low enough; a grasp is over when the
+pad is on the box, and the pad is 0.09 m across. So DESCEND only descends while
+the horizontal error is inside grasp_tolerance and simply holds height when it
+is not, rather than continuing down and missing. Sinking onto a box you are
+5 cm off is how you knock it across the yard.
+
+CLIMB is not decoration either. Leaving at working altitude means crossing the
+yard at 0.31 m with a box slung underneath, below the height the geofence and
+the avoidance were tuned for, and into whatever the next depot is next to.
+
+Which frame /cmd_vel is in
+--------------------------
+The body one, yaw-stabilized. This is worth stating flatly because getting it
+wrong is silent and fatal, and this package had it wrong: TwistController's
+cmd_vel callback sets
+
+    command_given_in_stabilized_frame_ = true;      // twist_controller.cpp:139
+
+and update() then rotates the command by the current yaw before using it. Only
+the command/twist topic - which nothing here publishes - is taken in the world
+frame.
+
+So a command of (speed, 0) means "forward", whatever the drone is pointed at.
+Building the command as (speed*cos(yaw), speed*sin(yaw)) - which is what a
+world-frame interface would want - gets rotated by yaw a second time and flies
+the aircraft along 2*yaw. That is not a wobble: at yaw 95 degrees the drone
+travels at 190, i.e. backwards and sideways, with its laser pointed at empty
+air. Measured that exactly - a drone yawed to 94.7 degrees moving along 215 -
+before this was found, and the whole fleet spent every run grinding into walls
+it was not looking at and scoring nothing.
+
+Everything this node publishes is therefore body-frame: linear.x is forward,
+linear.y is unused, and linear.z is untouched by the transform and so is the
+same in either frame.
+
+Why ALIGN exists on an aircraft
+-------------------------------
+Given the above it is not optional, but the reason is the laser rather than the
+frame. The scanner is bolted to the airframe, so its "front" sector only means
+"where I am going" if the drone is pointed where it is going. ALIGN is what
+keeps those two the same thing; CHASE then flies body-forward and the safety
+filter's three sectors mean what their names say.
+
+Staying out of each other's way
+-------------------------------
+Three aircraft sharing a yard need more than the laser, and the reason is
+geometric rather than a matter of tuning. The scanner is a horizontal plane on
+a mast: it sees another drone beautifully when the two are at the same height
+and cannot see it at all when one is above or below. That is precisely the
+geometry of the cases that matter here - one aircraft descending onto a depot
+while another crosses over the top of it, or two climbing away from adjacent
+depots into the same piece of sky.
+
+So deconfliction is done twice, structurally and reactively.
+
+Structurally, each courier transits on its own altitude layer: uav_0 at 1.3 m,
+uav_1 at 1.9, uav_2 at 2.5. A drone occupies roughly 0.56 m vertically - mast
+top at +0.25, a slung box at -0.31 - so a 0.6 m layer gap keeps transits from
+overlapping at all, and most of a run is transit. The layers all sit under the
+3 m crates, which is why those are as tall as the walls: a layer that cleared
+the obstacle field would be a layer whose drone never uses its laser.
+
+Reactively, and for everything the layers do not cover - the depots, where all
+three layers collapse onto the same descent - the courier knows where the other
+aircraft are, because it subscribes to their odometry. Inside separation_xy
+horizontally and separation_z vertically, one of the two yields: it stops,
+holds the altitude it had, and lets the other through.
+
+Which one yields has to be decided the same way by both, or they either both
+stop forever or neither does. The rule is: a loaded aircraft has right of way
+over an empty one, and between two in the same state the lower namespace wins.
+Both facts are known to both parties - who is carrying comes from the
+dispatcher's parcel board, which every courier already receives - so the two
+always reach opposite conclusions, and there is no negotiation to go wrong.
+
+Geofence and rescue
+-------------------
+A drone that is upset - clipped a crate, caught another drone's downwash - does
+not recover on its own here, and the reason is worth writing down. The launch
+sets hector's auto_engage false, and in this scenario that is not optional at
+all: auto_engage cuts the motors when it sees a commanded descent that is not
+being achieved, which is landing detection, and DESCEND is a commanded descent
+that ends 0.31 m off the deck and holds there. But twist_controller.cpp nests
+its flip-over check *inside* the same auto_engage block:
+
+    if (auto_engage_) {
+      ...
+      if (motors_running_ && load_factor < 0.0) {   // flip over?
+        motors_running_ = false;
+
+so turning the one off turns the other off with it. An inverted aircraft then
+keeps full thrust pointing wherever its rotors happen to face and leaves. That
+is not a hypothetical: uav_1 clipped a wall, went over it at 3.5 m, and was
+still accelerating 275 m away with the motors running when the run ended.
+
+So there are two fences. Outside fence_half_size the drone stops working the
+parcel and flies back to the middle - an ordinary soft geofence. Past
+fence_hard_size, or tilted past upset_angle, it is no longer a control problem,
+and the drone is teleported back to its launch point with
+/gazebo/set_model_state and re-engaged. Respawning is the honest fix in a
+simulator: there is no attitude recovery to write, because the controller that
+would fly it is the one that has already lost the aircraft.
+
+A respawn has to cut the motors on the way past, not just move the aircraft.
+TwistController only clears its PID integrators in the branch it takes when the
+motors are *not* running, so with auto_engage off there is no path that ever
+resets them. Teleporting alone leaves the attitude loop wound up against the
+tumble it was fighting a moment ago, and it spends that integral on the
+freshly-levelled aircraft and puts it straight back over. That is a respawn
+loop, and it is self-sustaining: 53 rescues in 90 seconds, none of which flew.
+So the order is /shutdown, teleport, settle, /engage - the shutdown is what
+makes the reset happen. Rescues are also rate-limited by settle_time, because
+a drone that has just been dropped in bounces on its landing gear and the
+attitude that produces is not an upset.
+
+What the laser cannot see
+-------------------------
+It is a horizontal 270-degree plane. It says nothing about what is above or
+below the aircraft, so altitude is flown open-loop with respect to obstacles
+and only min_altitude keeps it off the ground. That is survivable here because
+the crates and the walls are vertical and run the full height the drone flies
+at, so anything it could hit in transit, it can also see. A scene with real
+overhangs would need a sensor this aircraft does not have.
+
+It also means the descent is blind downwards, and this package leans on that
+harder than its siblings did, because the descent ends 0.31 m off the deck with
+a box slung below. Nothing stops the drone flying into the ground except
+work_altitude and min_altitude being honest numbers - and min_altitude here has
+to be *lower* than the working altitude rather than a floor above it, which is
+why it is a separate parameter and not simply the same number.
+
+Self-hits, and why the filter for them is conditional
+-----------------------------------------------------
+Past about 32 degrees of tilt the scan plane dips through the rotor discs and
+the drone sees its own booms at their tip radius, ~0.40 m (the mast height in
+urdf/quadrotor_courier.gazebo.xacro is where that number comes from). Read
+as obstacles those returns mean "boxed in", and the aircraft stops for good.
+
+The obvious guard - drop everything closer than 0.55 m - is worse than the
+disease, because it is precisely the range at which this drone gets into
+trouble. Jammed against a crate the laser reads 0.33 m; wedged in a corner,
+0.24 m. Both are below the threshold, so both are discarded, and a drone in
+contact with a wall sees a clear path through it and holds full forward thrust
+against it until it tips over. Two of the three drones ended a run that way.
+
+So the rejection is conditional on the thing that causes it. Tilt is known -
+it is in the same odometry the controller already reads - and below
+self_hit_tilt the plane is provably above the rotors, so returns are trusted
+down to the sensor floor. Above it, returns inside self_hit_range are dropped.
+The drone is briefly blind while recovering hard, which is the one moment it is
+not steering by the laser anyway.
+
+Subscriptions
+-------------
+  ground_truth/state      nav_msgs/Odometry      Drone pose + velocity
+  /<other>/ground_truth/state  nav_msgs/Odometry Every other aircraft
+  /delivery/parcels       uav_delivery/ParcelArray  Who is carrying what
+  delivery/task           uav_delivery/Parcel    This drone's job
+  /gazebo/model_states    gazebo_msgs/ModelStates Where the box really is
+  scan                    sensor_msgs/LaserScan  Hokuyo, on the mast
+
+Publications
+------------
+  cmd_vel                 geometry_msgs/Twist    Body-frame velocity (~20 Hz)
+  /delivery/report        uav_delivery/Parcel    Grasped / released / gave up
+
+Services used
+-------------
+  engage                  std_srvs/Empty         Spin the motors up
+  shutdown                std_srvs/Empty         Cut them, to clear the PIDs
+  /link_attacher_node/attach   gazebo_ros_link_attacher/Attach   the gripper
+  /link_attacher_node/detach   gazebo_ros_link_attacher/Attach
+
+ROS Parameters (private, ~)
+---------------------------
+  ~cruise_altitude float  Transit altitude, m                (default 1.4)
+  ~grasp_reach     float  Pad below base_link; match the urdf(default 0.21)
+  ~box_size        float  Edge of a box, m                   (default 0.10)
+  ~min_altitude    float  Never command below this, m        (default 0.26)
+  ~grasp_tolerance float  Descend only when centred within
+                          this, m                            (default 0.060)
+  ~hover_margin    float  Hold this far above the working
+                          altitude while centring, m         (default 0.20)
+  ~grasp_z_tol     float  Working altitude reached within, m (default 0.030)
+  ~act_timeout     float  Give the parcel back after this
+                          long stuck in a descent, s         (default 40.0)
+  ~linear_speed    float  Max forward speed (m/s)            (default 1.2)
+  ~vertical_speed  float  Max climb/descent rate (m/s)       (default 0.6)
+  ~station_gain    float  P-gain for holding over the goal   (default 1.2)
+  ~station_speed   float  Speed cap while station-keeping    (default 0.6)
+  ~angular_gain    float  P-gain for heading error           (default 2.0)
+  ~max_angular     float  Yaw rate cap (rad/s)               (default 1.5)
+  ~angle_tol       float  Heading tolerance (rad)            (default 0.12)
+  ~slow_dist       float  Begin slowing at this dist (m)     (default 1.0)
+  ~arrive_radius   float  Switch to DESCEND inside this, m   (default 0.60)
+  ~fleet           list   Every drone namespace, for traffic (default [])
+  ~separation_xy   float  Traffic conflict radius, m         (default 1.5)
+  ~separation_z    float  ...and vertically, m               (default 0.5)
+  ~yield_speed     float  Speed to back away when giving way (default 0.5)
+  ~depot_guard_xy  float  Do not descend if another aircraft
+                          is this close to my goal, m        (default 1.3)
+  ~depot_guard_z   float  ...and below work_alt plus this, m (default 0.7)
+  ~climb_tol       float  Cruise reached within this, m      (default 0.20)
+  ~avoid_dist      float  Avoidance activation range (m)     (default 1.6)
+  ~stop_dist       float  Full-stop obstacle range (m)       (default 0.9)
+  ~min_valid_range float  Sensor floor; drop returns below   (default 0.15)
+  ~self_hit_range  float  Drop returns below this when tilted(default 0.50)
+  ~self_hit_tilt   float  Tilt at which the mast stops
+                          clearing the rotors, rad           (default 0.50)
+  ~back_off_speed  float  Reverse speed when fully blocked   (default 0.35)
+  ~avoid_hold      float  Stay committed to a deflection for
+                          this long after it clears, s       (default 1.5)
+  ~fence_half_size float  Soft geofence half-width, m        (default 4.8)
+  ~fence_hard_size float  Respawn beyond this half-width, m  (default 8.0)
+  ~fence_max_alt   float  Respawn above this altitude, m     (default 4.0)
+  ~upset_angle     float  Respawn past this roll/pitch, rad  (default 1.05)
+  ~settle_time     float  Ignore upsets for this long after
+                          a respawn, s                       (default 1.5)
+  ~start_x         float  Launch point, for respawns         (default 0.0)
+  ~start_y         float  Launch point, for respawns         (default 0.0)
+  ~control_hz      float  Control loop rate (Hz)             (default 20.0)
+  ~status_hz       float  Status display rate (Hz)           (default 2.0)
+"""
+
+import math
+import sys
+
+import rospy
+
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import LaserScan
+from std_srvs.srv import Empty
+from gazebo_msgs.msg import ModelState, ModelStates
+from gazebo_msgs.srv import SetModelState
+from gazebo_ros_link_attacher.srv import Attach, AttachRequest
+from tf.transformations import euler_from_quaternion
+
+from uav_delivery.msg import Parcel, ParcelArray
+
+# See the note in scripts/dispatcher: roslaunch pipes a node's output and
+# Python block-buffers into a pipe. rospy puts WARN and ERROR on stderr, which
+# on Python 3.8 buffers the same way, so without this the warnings that matter
+# most - rescues, given-up parcels - arrive late or not at all.
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
+_RESET  = '\033[0m'
+_BOLD   = '\033[1m'
+_YELLOW = '\033[93m'
+_GREEN  = '\033[92m'
+_CYAN   = '\033[96m'
+_RED    = '\033[91m'
+_WHITE  = '\033[97m'
+
+
+def _bar(value, max_value=10.0, width=10):
+    filled = round(width * value / max(max_value, 1))
+    return _GREEN + '#' * filled + _RESET + '-' * (width - filled)
+
+
+def _normalize_angle(a):
+    while a > math.pi:
+        a -= 2.0 * math.pi
+    while a < -math.pi:
+        a += 2.0 * math.pi
+    return a
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+class Courier:
+
+    def __init__(self):
+        rospy.init_node('courier', anonymous=False)
+
+        self._ns = rospy.get_namespace().strip('/') or 'uav'
+
+        self._cruise_alt   = rospy.get_param('~cruise_altitude', 1.4)
+        self._grasp_reach  = rospy.get_param('~grasp_reach',     0.21)
+        self._box_size     = rospy.get_param('~box_size',        0.10)
+        self._min_alt      = rospy.get_param('~min_altitude',    0.26)
+        self._grasp_tol    = rospy.get_param('~grasp_tolerance', 0.060)
+        self._hover_margin = rospy.get_param('~hover_margin',    0.20)
+        self._grasp_z_tol  = rospy.get_param('~grasp_z_tol',     0.030)
+        self._act_timeout  = rospy.get_param('~act_timeout',     40.0)
+
+        # The one altitude the whole job turns on. To put the pad on top of a
+        # box sitting on the ground, base_link has to be at box_size (the top
+        # face) plus grasp_reach (the pad's offset below base_link). The same
+        # number does for the delivery leg, because setting a carried box down
+        # on the ground means putting its underside at zero, which is the pose
+        # it was welded in.
+        self._work_alt = self._box_size + self._grasp_reach
+        self._lin_speed    = rospy.get_param('~linear_speed',    1.2)
+        self._vert_speed   = rospy.get_param('~vertical_speed',  0.6)
+        self._stn_gain     = rospy.get_param('~station_gain',    1.2)
+        self._stn_speed    = rospy.get_param('~station_speed',   0.6)
+        self._ang_gain     = rospy.get_param('~angular_gain',    2.0)
+        self._max_ang      = rospy.get_param('~max_angular',     1.5)
+        self._angle_tol    = rospy.get_param('~angle_tol',       0.12)
+        self._slow_dist    = rospy.get_param('~slow_dist',       1.0)
+        self._arrive_rad   = rospy.get_param('~arrive_radius',   0.60)
+        self._fleet        = rospy.get_param('~fleet',           [])
+        self._sep_xy       = rospy.get_param('~separation_xy',   1.5)
+        self._sep_z        = rospy.get_param('~separation_z',    0.5)
+        self._yield_speed  = rospy.get_param('~yield_speed',      0.5)
+        self._depot_guard_xy = rospy.get_param('~depot_guard_xy', 1.3)
+        self._depot_guard_z  = rospy.get_param('~depot_guard_z',  0.7)
+        self._climb_tol    = rospy.get_param('~climb_tol',       0.20)
+        self._avoid_dist   = rospy.get_param('~avoid_dist',      1.6)
+        self._stop_dist    = rospy.get_param('~stop_dist',       0.9)
+        self._min_range    = rospy.get_param('~min_valid_range', 0.15)
+        self._self_hit     = rospy.get_param('~self_hit_range',  0.50)
+        self._self_hit_tilt = rospy.get_param('~self_hit_tilt',  0.50)
+        self._back_off     = rospy.get_param('~back_off_speed',  0.35)
+        self._avoid_hold   = rospy.get_param('~avoid_hold',      1.5)
+        self._fence        = rospy.get_param('~fence_half_size', 4.8)
+        self._fence_hard   = rospy.get_param('~fence_hard_size', 8.0)
+        self._fence_alt    = rospy.get_param('~fence_max_alt',   4.0)
+        self._upset_angle  = rospy.get_param('~upset_angle',     1.05)
+        self._settle_time  = rospy.get_param('~settle_time',     1.5)
+        self._start_x      = rospy.get_param('~start_x',         0.0)
+        self._start_y      = rospy.get_param('~start_y',         0.0)
+        control_hz         = rospy.get_param('~control_hz',     20.0)
+        status_hz          = rospy.get_param('~status_hz',       2.0)
+
+        self._x = self._y = self._z = 0.0
+        self._roll = self._pitch = self._yaw = 0.0
+        self._odom_ready = False
+        self._rescues = 0
+        self._settle_until = rospy.Time(0)
+
+        self._scan = None
+        self._avoiding = False
+        self._avoid_until = rospy.Time(0)
+        self._fenced = False
+
+        self._parcel = None          # the job, as the dispatcher stated it
+        self._holding = None         # box model name, or None
+        self._awaiting = False       # released; waiting for the dispatcher\'s verdict
+        self._state = 'TAKEOFF'
+        self._wait_ticks = 0
+        self._descend_since = None   # when this descent started, for the timeout
+        self._delivered = 0
+        self._history = []
+
+        # Where the box actually is, rather than where the depot is. On the
+        # pickup leg these differ: the dispatcher puts a box down at a depot,
+        # but a box that was previously misdelivered sits wherever it landed,
+        # and descending onto the depot marking instead of onto the box would
+        # grasp thin air.
+        self._box_pose = {}
+
+        # Traffic. Positions of every other aircraft, and which of them are
+        # loaded - the second half comes free off the dispatcher's board, so
+        # right-of-way needs no extra topic and no negotiation.
+        self._others = {}            # ns -> (x, y, z)
+        self._loaded = set()         # namespaces currently carrying a box
+        self._yielding = False
+        self._yield_z = None
+        self._yield_began = None
+        for other in self._fleet:
+            if other == self._ns:
+                continue
+            rospy.Subscriber('/%s/ground_truth/state' % other, Odometry,
+                             self._other_cb, callback_args=other)
+        rospy.Subscriber('/delivery/parcels', ParcelArray, self._board_cb)
+
+        rospy.Subscriber('ground_truth/state', Odometry, self._odom_cb)
+        rospy.Subscriber('delivery/task', Parcel, self._task_cb)
+        rospy.Subscriber('scan', LaserScan, self._scan_cb)
+        rospy.Subscriber('/gazebo/model_states', ModelStates, self._models_cb,
+                         queue_size=1)
+
+        self._cmd_pub = rospy.Publisher('cmd_vel', Twist, queue_size=1)
+        self._report_pub = rospy.Publisher('/delivery/report', Parcel,
+                                           queue_size=10)
+
+        # Held open rather than looked up per call: a rescue is the one moment
+        # this node is in a hurry, and it needs all three of these.
+        self._engage_srv = None
+        self._shutdown_srv = None
+        self._set_state_srv = None
+        self._attach_srv = None
+        self._detach_srv = None
+        self._connect_services()
+
+        self._engage()
+
+        rospy.Timer(rospy.Duration(1.0 / control_hz), self._control_loop)
+        rospy.Timer(rospy.Duration(1.0 / status_hz), self._status_display)
+
+        self._print_header()
+
+    # ------------------------------------------------------------ motors ---
+    def _connect_services(self):
+        try:
+            rospy.wait_for_service('engage', timeout=60.0)
+            rospy.wait_for_service('shutdown', timeout=10.0)
+            rospy.wait_for_service('/gazebo/set_model_state', timeout=10.0)
+        except rospy.ROSException as exc:
+            rospy.logerr('[%s] services never appeared: %s', self._ns, exc)
+            return
+        self._engage_srv    = rospy.ServiceProxy('engage', Empty)
+        self._shutdown_srv  = rospy.ServiceProxy('shutdown', Empty)
+        self._set_state_srv = rospy.ServiceProxy('/gazebo/set_model_state',
+                                                 SetModelState)
+
+        # The gripper. If the world plugin did not load these never appear, and
+        # the failure is worth naming precisely, because it is almost always
+        # GAZEBO_PLUGIN_PATH rather than anything in this package.
+        try:
+            rospy.wait_for_service('/link_attacher_node/attach', timeout=30.0)
+        except rospy.ROSException:
+            rospy.logfatal(
+                '[%s] /link_attacher_node/attach never appeared. '
+                'gazebo_ros_link_attacher did not load - check that '
+                'GAZEBO_PLUGIN_PATH contains ~/uav_ws/devel/lib (source '
+                'setup_uav.bash) and that depot_yard.world still has the '
+                'ros_link_attacher_plugin <plugin> tag.', self._ns)
+            return
+        self._attach_srv = rospy.ServiceProxy('/link_attacher_node/attach', Attach)
+        self._detach_srv = rospy.ServiceProxy('/link_attacher_node/detach', Attach)
+
+    def _engage(self):
+        """Spin the motors up.
+
+        The launch turns hector's auto_engage off. Left on it engages on the
+        first commanded climb and, more to the point, cuts the motors when it
+        sees a commanded descent it cannot achieve. That is landing detection,
+        and DESCEND is indistinguishable from a landing by design: a commanded
+        descent that ends 0.31 m off the deck and holds there while a weld is
+        made or broken.
+        """
+        if self._engage_srv is None:
+            return
+        try:
+            self._engage_srv()
+            rospy.loginfo('[%s] motors engaged', self._ns)
+        except rospy.ServiceException as exc:
+            rospy.logerr('[%s] could not engage motors: %s', self._ns, exc)
+
+    def _shutdown_motors(self):
+        """Cut the motors, which is the only thing that resets the PIDs.
+
+        See "Geofence and rescue" above: with auto_engage off, TwistController
+        never takes the branch that calls reset(), so this is the sole way to
+        empty its integrators.
+        """
+        if self._shutdown_srv is None:
+            return
+        try:
+            self._shutdown_srv()
+        except rospy.ServiceException as exc:
+            rospy.logwarn('[%s] could not shut motors down: %s', self._ns, exc)
+
+    # ------------------------------------------------------------- fence ---
+    def _lost(self):
+        """True if the aircraft is beyond saving by ordinary control."""
+        return (abs(self._x) > self._fence_hard or
+                abs(self._y) > self._fence_hard or
+                self._z > self._fence_alt or
+                abs(self._roll) > self._upset_angle or
+                abs(self._pitch) > self._upset_angle)
+
+    def _outside_fence(self):
+        return abs(self._x) > self._fence or abs(self._y) > self._fence
+
+    def _rescue(self):
+        """Teleport back to the launch point, stopped and level, and re-engage.
+
+        Order matters. The motors go off *first*: that is what empties the
+        attitude PIDs, and a teleport without it hands the freshly-levelled
+        aircraft the integral the controller had wound up fighting the tumble.
+        """
+        # Let go first. A box is welded to base_link with a fixed joint, and
+        # teleporting one end of a fixed joint across the yard is not a state
+        # Gazebo has any reason to handle gracefully. Dropping it also gets the
+        # parcel back on the board: it falls, comes to rest, and the dispatcher
+        # re-lists it from wherever that turns out to be.
+        if self._holding is not None:
+            rospy.logwarn('[%s] dropping %s to be rescued', self._ns,
+                          self._holding)
+            self._release()
+            self._report(Parcel.WAITING)
+            self._parcel = None
+            self._awaiting = False
+            self._descend_since = None
+
+        self._rescues += 1
+        rospy.logwarn('[%s] RESCUE #%d - lost at (%.1f, %.1f, %.1f) '
+                      'roll=%.0f pitch=%.0f deg; respawning at (%.1f, %.1f)',
+                      self._ns, self._rescues, self._x, self._y, self._z,
+                      math.degrees(self._roll), math.degrees(self._pitch),
+                      self._start_x, self._start_y)
+
+        self._cmd_pub.publish(Twist())
+        self._shutdown_motors()
+
+        state = ModelState()
+        state.model_name = self._ns
+        state.reference_frame = 'world'
+        state.pose.position.x = self._start_x
+        state.pose.position.y = self._start_y
+        state.pose.position.z = 0.3
+        state.pose.orientation.w = 1.0
+        if self._set_state_srv is None:
+            rospy.logerr('[%s] respawn unavailable - no set_model_state',
+                         self._ns)
+            return
+        try:
+            self._set_state_srv(state)
+        except rospy.ServiceException as exc:
+            rospy.logerr('[%s] respawn failed: %s', self._ns, exc)
+            return
+
+        # Let the teleport settle before commanding anything, or the first
+        # command is computed against the pose it had before it moved. The
+        # motors are off through this, so nothing is being flown.
+        rospy.sleep(0.5)
+        self._cmd_pub.publish(Twist())
+        self._engage()
+        self._state = 'TAKEOFF'
+        self._avoiding = False
+        self._yielding = False
+        self._yield_z = None
+
+        # Landing gear bounce is not an upset. Without this hold the next tick
+        # sees the attitude of a drone still settling on its feet and rescues
+        # it again, which is how a single bad moment became 53 of them.
+        self._settle_until = rospy.Time.now() + rospy.Duration(self._settle_time)
+
+    # ------------------------------------------------------ laser helpers ---
+    def _sector_min(self, deg_from, deg_to):
+        """Minimum valid range in an angular sector, degrees, 0 = forward.
+
+        The scan is 270 degrees centred on forward, not the TurtleBot3's full
+        360, so index-to-angle uses angle_min and angle_increment from the
+        message rather than tb3_treasure's `i * 360 / n`. That shortcut is only
+        correct for a scanner that closes the circle, and using it here would
+        silently rotate every sector by 45 degrees.
+
+        The floor is normally just the sensor's own, so a wall the drone is
+        already touching is still a wall. It rises to self_hit_range only while
+        the aircraft is tilted past the angle at which the mast stops clearing
+        the rotors - see "Self-hits" at the top of this file.
+        """
+        scan = self._scan
+        if scan is None:
+            return float('inf')
+
+        floor = max(scan.range_min, self._min_range)
+        if max(abs(self._roll), abs(self._pitch)) > self._self_hit_tilt:
+            floor = max(floor, self._self_hit)
+        a = deg_from % 360.0
+        b = deg_to % 360.0
+        best = float('inf')
+        for i, r in enumerate(scan.ranges):
+            if not math.isfinite(r) or not (floor < r < scan.range_max):
+                continue
+            deg = math.degrees(scan.angle_min + i * scan.angle_increment) % 360.0
+            in_sector = (a <= deg <= b) if a <= b else (deg >= a or deg <= b)
+            if in_sector and r < best:
+                best = r
+        return best
+
+    def _safety_filter(self, cmd):
+        """Reactive obstacle avoidance, applied to CHASE commands.
+
+        Same three-sector logic as tb3_treasure - front +-45, left 10-80,
+        right 280-350 - and, like tb3_treasure's, it works directly on
+        cmd.linear.x, because /cmd_vel here is body-frame too. Vertical
+        velocity is left alone: the laser has nothing to say about it.
+        """
+        front = self._sector_min(315.0, 45.0)
+
+        if front > self._avoid_dist:
+            self._avoiding = False
+            return cmd
+
+        self._avoiding = True
+        self._avoid_until = rospy.Time.now() + rospy.Duration(self._avoid_hold)
+        left = self._sector_min(10.0, 80.0)
+        right = self._sector_min(280.0, 350.0)
+        turn_left = left >= right
+
+        if front <= self._stop_dist:
+            # Stop, back away, and yaw toward the clearer side.
+            #
+            # tb3_treasure only stops and spins, which works for a robot that
+            # can pivot on the spot and then drive out along a new heading.
+            # This one cannot always: caught against a wall it spins, and every
+            # heading it turns to still has the wall in front, so it spins for
+            # the rest of the run. Observed exactly that - all three drones
+            # pinned to walls at max yaw rate, scoring nothing. Reversing is
+            # what actually breaks the deadlock, and it is free here because a
+            # multirotor has no preferred direction of travel.
+            cmd.linear.x = -self._back_off
+            cmd.linear.y = 0.0
+            cmd.angular.z = self._max_ang if turn_left else -self._max_ang
+        else:
+            ratio = ((front - self._stop_dist) /
+                     (self._avoid_dist - self._stop_dist))
+            cmd.linear.x *= ratio
+
+            avoid_w = self._max_ang * (1.0 - ratio)
+            if turn_left:
+                cmd.angular.z = min(self._max_ang, cmd.angular.z + avoid_w)
+            else:
+                cmd.angular.z = max(-self._max_ang, cmd.angular.z - avoid_w)
+
+        return cmd
+
+    # ----------------------------------------------------------- display ---
+    def _print_header(self):
+        print()
+        print(_BOLD + _WHITE + '+--------------------------------------------------+' + _RESET)
+        print(_BOLD + _WHITE + '|   UAV COURIER  -  %-30s |' % self._ns + _RESET)
+        print(_BOLD + _WHITE + '+--------------------------------------------------+' + _RESET)
+        print('  %scruise_alt%s   = %.2f m     %swork_altitude%s = %.2f m'
+              % (_CYAN, _RESET, self._cruise_alt, _CYAN, _RESET, self._work_alt))
+        print('  %sarrive_rad%s   = %.2f m     %sgrasp_tol%s     = %.3f m'
+              % (_CYAN, _RESET, self._arrive_rad, _CYAN, _RESET, self._grasp_tol))
+        print('  %savoid_dist%s   = %.2f m     %sstop_dist%s     = %.2f m'
+              % (_CYAN, _RESET, self._avoid_dist, _CYAN, _RESET, self._stop_dist))
+        print()
+
+    def _print_delivery(self, n, parcel):
+        print(_BOLD + _GREEN + '+--------------------------------------------------+' + _RESET)
+        print(_BOLD + _GREEN + '|  *** DELIVERED  %-6s  (parcel #%-3d) ***       |'
+              % (self._ns, parcel.id) + _RESET)
+        print(_BOLD + _GREEN + '+--------------------------------------------------+' + _RESET)
+        print('  Route            : %s%s%s  ->  %s%s%s'
+              % (_YELLOW, parcel.src_name, _RESET, _YELLOW, parcel.dst_name, _RESET))
+        print('  Set down at      : (%6.2f, %6.2f) m' % (parcel.dst_x, parcel.dst_y))
+        print('  Released from    : (%6.2f, %6.2f, %5.2f) m'
+              % (self._x, self._y, self._z))
+        print('  Delivered so far : %s%s%4d%s' % (_YELLOW, _BOLD, n, _RESET))
+        print()
+        if len(self._history) > 1:
+            print('  Recent runs:')
+            for i, route in self._history[-5:]:
+                marker = _GREEN + '>>>' + _RESET if i == n else '   '
+                print('    %s #%-3d  %s' % (marker, i, route))
+            print()
+
+    def _status_display(self, _event):
+        if not self._odom_ready:
+            return
+        state_col = {'ALIGN': _CYAN, 'CHASE': _GREEN, 'DESCEND': _YELLOW,
+                     'CLIMB': _CYAN, 'ACT': _GREEN, 'WAIT': _YELLOW,
+                     'HOLD': _YELLOW, 'IDLE': _WHITE,
+                     'TAKEOFF': _WHITE}.get(self._state, _WHITE)
+        avoid_tag = ' %s[AVOID]%s' % (_RED, _RESET) if self._avoiding else ''
+        if self._yielding:
+            avoid_tag += ' %s[YIELD]%s' % (_RED, _RESET)
+        # The fence replaces the goal, so say so - otherwise the status line
+        # shows a depot the drone has temporarily stopped flying toward.
+        if self._fenced:
+            avoid_tag += ' %s[FENCE]%s' % (_RED, _RESET)
+        load = (' %s[%s]%s' % (_YELLOW, self._holding, _RESET)
+                if self._holding else '')
+
+        if self._parcel is None:
+            print('  [%s] [%s%-7s%s]%s pos=(%6.2f,%6.2f,%5.2f) no job | '
+                  'delivered=%d'
+                  % (self._ns, state_col, self._state, _RESET, avoid_tag,
+                     self._x, self._y, self._z, self._delivered))
+            return
+
+        gx, gy = self._goal()
+        dist_xy = math.hypot(gx - self._x, gy - self._y)
+        p = self._parcel
+        print('  [%s] [%s%-7s%s]%s%s pos=(%6.2f,%6.2f,%5.2f) #%d %s>%s '
+              '%s-leg goal=(%5.2f,%5.2f) dist=%s%5.2f%s delivered=%s%s%3d%s'
+              % (self._ns, state_col, self._state, _RESET, avoid_tag, load,
+                 self._x, self._y, self._z, p.id, p.src_name, p.dst_name,
+                 self._leg[:4].lower(), gx, gy,
+                 _CYAN, dist_xy, _RESET, _YELLOW, _BOLD, self._delivered,
+                 _RESET))
+
+    # ------------------------------------------------------------- gripper --
+    def _report(self, state):
+        """Tell the dispatcher what just happened to the parcel."""
+        if self._parcel is None:
+            return
+        msg = Parcel()
+        msg.id = self._parcel.id
+        msg.box = self._parcel.box
+        msg.carrier = self._ns
+        msg.state = state
+        self._report_pub.publish(msg)
+
+    def _grasp(self):
+        """Weld the box to the airframe, wherever it currently sits.
+
+        The joint is made at the two links\' present relative pose, so the box
+        is not snapped into the gripper - it stays exactly where it is and the
+        aircraft has to have positioned itself properly first. A sloppy
+        approach gives a crooked carry, not a corrected one, which is the whole
+        reason DESCEND refuses to come down while off-centre.
+
+        The weld is to base_link rather than gripper_link because Gazebo folds
+        fixed-joint children into their parent, so there is no body called
+        gripper_link in the simulator for the attacher to find.
+        """
+        if self._attach_srv is None or self._parcel is None:
+            return False
+        req = AttachRequest()
+        req.model_name_1 = self._ns
+        req.link_name_1 = 'base_link'
+        req.model_name_2 = self._parcel.box
+        req.link_name_2 = 'link'
+        try:
+            self._attach_srv(req)
+        except rospy.ServiceException as exc:
+            rospy.logerr('[%s] attach failed: %s', self._ns, exc)
+            return False
+        self._holding = self._parcel.box
+        rospy.loginfo('[%s] picked up %s at %s', self._ns, self._parcel.box,
+                      self._parcel.src_name)
+        self._report(Parcel.CARRIED)
+        return True
+
+    def _release(self):
+        """Unweld the carried box and leave it where it is."""
+        if self._detach_srv is None or self._holding is None:
+            return
+        req = AttachRequest()
+        req.model_name_1 = self._ns
+        req.link_name_1 = 'base_link'
+        req.model_name_2 = self._holding
+        req.link_name_2 = 'link'
+        try:
+            self._detach_srv(req)
+        except rospy.ServiceException as exc:
+            rospy.logerr('[%s] detach failed: %s', self._ns, exc)
+            return
+        rospy.loginfo('[%s] released %s at %s', self._ns, self._holding,
+                      self._parcel.dst_name if self._parcel else '?')
+        self._holding = None
+
+    def _abandon(self, why):
+        """Give the parcel back to the dispatcher.
+
+        Called when a descent will not converge, and on a respawn. Somebody
+        has to say so out loud: the dispatcher\'s assignments are sticky, so a
+        parcel whose courier quietly stopped working it would sit claimed
+        forever and no other aircraft would ever be offered it.
+        """
+        rospy.logwarn('[%s] giving up parcel %s: %s', self._ns,
+                      self._parcel.id if self._parcel else '?', why)
+        self._release()
+        self._report(Parcel.WAITING)
+        self._parcel = None
+        self._awaiting = False
+        self._descend_since = None
+        self._state = 'CLIMB'
+
+    # -------------------------------------------------------------- traffic --
+    def _gives_way_to(self, other):
+        """Do I yield to `other`? Both sides must answer this oppositely.
+
+        A loaded aircraft has right of way over an empty one, because it is the
+        one whose loss costs a parcel and because it is the less manoeuvrable
+        of the two. Between two in the same state the lower namespace wins,
+        which is arbitrary but total - and total is the property that matters,
+        since a rule where both could yield is a rule where both stop forever.
+
+        Both inputs are shared knowledge: positions come from odometry and the
+        loaded set comes from the dispatcher's board, which every courier
+        receives. Neither side is asking the other anything, so there is no
+        negotiation to fail.
+        """
+        me_loaded = self._holding is not None
+        other_loaded = other in self._loaded
+        if me_loaded != other_loaded:
+            return not me_loaded
+        return self._ns > other
+
+    def _traffic_conflict(self):
+        """The nearest aircraft I must give way to, or None.
+
+        This is the half of collision avoidance the laser cannot do. A
+        horizontal scan plane sees another drone only when the two are at
+        much the same height, and the encounters that matter here are exactly
+        the ones where they are not: somebody descending onto a depot while
+        somebody else crosses above it.
+        """
+        nearest, nearest_d = None, float('inf')
+        for other, (ox, oy, oz) in self._others.items():
+            if abs(oz - self._z) > self._sep_z:
+                continue
+            d = math.hypot(ox - self._x, oy - self._y)
+            if d > self._sep_xy:
+                continue
+            if not self._gives_way_to(other):
+                continue
+            if d < nearest_d:
+                nearest, nearest_d = other, d
+        return nearest, nearest_d
+
+    def _give_way(self, cmd, other):
+        """Back away from `other`, holding the altitude we had.
+
+        Backing away rather than merely stopping, and that distinction is the
+        whole of it. The first version stopped dead, which sounds like the
+        polite thing and does not work: the aircraft with right of way is still
+        flying, and if its goal lies beyond the one that stopped, it flies
+        straight into it. Measured - uav_1 gave way at 0.32 m and the pair
+        closed to 0.08 m anyway, because only one of them was doing anything.
+        Retreating along the line between the two makes the gap open regardless
+        of what the other aircraft chooses to do, which is the property a
+        collision avoidance rule actually needs.
+
+        The retreat is a world-frame direction rotated into the body frame,
+        like the descent, because /cmd_vel is body-stabilized.
+
+        Altitude is held as a commanded *altitude*, not a commanded zero rate:
+        controller/twist closes on velocity, so zero is "stop climbing" and the
+        aircraft sinks about a centimetre a second underneath it.
+        """
+        if self._yield_z is None:
+            self._yield_z = max(self._z, self._min_alt)
+
+        ox, oy, _ = self._others[other]
+        away_x, away_y = self._x - ox, self._y - oy
+        norm = math.hypot(away_x, away_y)
+        if norm < 1e-3:
+            # Directly on top of each other in plan view: any direction will
+            # do, so pick one deterministically rather than dividing by zero.
+            away_x, away_y, norm = 1.0, 0.0, 1.0
+        away_x, away_y = away_x / norm, away_y / norm
+
+        bx = away_x * math.cos(self._yaw) + away_y * math.sin(self._yaw)
+        by = -away_x * math.sin(self._yaw) + away_y * math.cos(self._yaw)
+        cmd.linear.x = self._yield_speed * bx
+        cmd.linear.y = self._yield_speed * by
+        cmd.angular.z = 0.0
+        cmd.linear.z = _clamp(1.0 * (self._yield_z - self._z),
+                              -self._vert_speed, self._vert_speed)
+        return cmd
+
+    def _descent_clear(self):
+        """Is the whole column below me, over my goal, free of other aircraft?
+
+        The altitude layers separate transits completely, and then every one of
+        them collapses onto the same descent at a depot - which is exactly
+        where the conflicts turned out to be. So the descent is serialised:
+        while anything is in the way, I stay up on my own layer, where I am
+        separated from everybody by construction, and queue.
+
+        "In the way" means *anywhere below me* near the goal, not merely down
+        in the depot, and the difference is not academic. The first version
+        only looked for aircraft already at working height, so a drone on the
+        top layer would happily start down through the middle layer at a point
+        where another aircraft was transiting. Measured: uav_2 descending from
+        2.6 m and uav_1 cruising at 1.9 passed within 0.09 m of each other, and
+        neither noticed until they were already co-altitude - by which time the
+        horizontal overlap was total and the yield rule had nothing useful left
+        to do. A descent is a move through every layer underneath you, so the
+        check has to cover every layer underneath you.
+
+        Waiting up here costs a few seconds. Descending into traffic costs both
+        aircraft.
+        """
+        gx, gy = self._goal()
+        for ox, oy, oz in self._others.values():
+            if oz > self._z - 0.20:
+                continue          # at or above me, so not in the column below
+            if math.hypot(ox - gx, oy - gy) < self._depot_guard_xy:
+                return False
+        return True
+
+    # --------------------------------------------------------------- goals --
+    @property
+    def _leg(self):
+        """Which half of the job this is - derived, never stored.
+
+        A courier is on the delivery leg exactly when it is holding something.
+        Keeping that as a separate flag invites the two to disagree, and there
+        is a specific way it happens: a parcel that is put down off-target is
+        re-listed by the dispatcher as a fresh pickup, and a stored leg would
+        still say DELIVERY, sending an empty aircraft to the address to release
+        a box it is not carrying.
+        """
+        return 'DELIVERY' if self._holding is not None else 'PICKUP'
+
+    def _goal(self):
+        """Where this leg is trying to get to, horizontally.
+
+        On the pickup leg that is the box itself if Gazebo has told us where it
+        is, and the stated source only as a fallback. Those differ whenever a
+        box has been misdelivered and re-listed from where it came to rest, and
+        descending onto a stale depot marking instead of onto the box is a
+        grasp of thin air.
+        """
+        p = self._parcel
+        if self._leg == 'DELIVERY':
+            return p.dst_x, p.dst_y
+        pos = self._box_pose.get(p.box)
+        if pos is not None:
+            return pos[0], pos[1]
+        return p.src_x, p.src_y
+
+    # --------------------------------------------------------- callbacks ---
+    def _odom_cb(self, msg):
+        self._x = msg.pose.pose.position.x
+        self._y = msg.pose.pose.position.y
+        self._z = msg.pose.pose.position.z
+        q = msg.pose.pose.orientation
+        self._roll, self._pitch, self._yaw = euler_from_quaternion(
+            [q.x, q.y, q.z, q.w])
+        self._odom_ready = True
+
+    def _scan_cb(self, msg):
+        self._scan = msg
+
+    def _other_cb(self, msg, ns):
+        p = msg.pose.pose.position
+        self._others[ns] = (p.x, p.y, p.z)
+
+    def _board_cb(self, msg):
+        self._loaded = set(p.carrier for p in msg.parcels
+                           if p.state == Parcel.CARRIED and p.carrier)
+
+    def _models_cb(self, msg):
+        """Where every box is. Boxes are named order_<customer>; that prefix is
+        a contract with the dispatcher's _Job.box."""
+        for name, pose in zip(msg.name, msg.pose):
+            if name.startswith('order_'):
+                self._box_pose[name] = (pose.position.x, pose.position.y,
+                                        pose.position.z)
+
+    def _task_cb(self, msg):
+        """A job from the dispatcher.
+
+        Assignments are sticky, so unlike the continuously-retasked siblings of
+        this node most of these messages are simply the dispatcher restating
+        the job already in hand, and the common case is to ignore them. The
+        two that matter are a genuinely new parcel and the dispatcher
+        confirming a delivery it has verified on the ground.
+        """
+        same = self._parcel is not None and msg.id == self._parcel.id
+
+        if same and msg.state == Parcel.DELIVERED:
+            self._delivered += 1
+            self._history.append(
+                (self._delivered, '%s -> %s' % (msg.src_name, msg.dst_name)))
+            self._print_delivery(self._delivered, msg)
+            self._parcel = None
+            self._awaiting = False
+            self._descend_since = None
+            self._state = 'CLIMB'
+            return
+
+        if msg.state not in (Parcel.CLAIMED, Parcel.CARRIED):
+            return
+
+        self._parcel = msg
+
+        if self._awaiting:
+            # Released, and the dispatcher has come back with work rather than
+            # a delivery: the box did not land where it should have, and this
+            # is the same parcel re-listed as a fresh pickup. The leg follows
+            # from the empty gripper, so there is nothing to reset but the
+            # waiting flag and the approach.
+            self._awaiting = False
+            self._descend_since = None
+            print('  [%s] %s[RE-LISTED]%s parcel %d  %s -> %s'
+                  % (self._ns, _RED, _RESET, msg.id, msg.src_name, msg.dst_name))
+            if self._state not in ('TAKEOFF', 'ACT'):
+                self._state = 'ALIGN'
+            return
+
+        if same:
+            # The dispatcher restating the job already in hand, which is most
+            # of these. Taking the message keeps the addresses fresh; the
+            # source can move under us if the parcel was re-listed.
+            return
+
+        self._descend_since = None
+        print('  [%s] %s[JOB]%s parcel %d  %s -> %s'
+              % (self._ns, _CYAN, _RESET, msg.id, msg.src_name, msg.dst_name))
+        if self._state not in ('TAKEOFF', 'ACT'):
+            self._state = 'ALIGN'
+
+    # -------------------------------------------------------- control loop --
+    def _control_loop(self, _event):
+        if not self._odom_ready:
+            return
+
+        cmd = Twist()
+
+        # Lost aircraft first, before any state does anything with it. There
+        # is no command that helps here - see "Geofence and rescue" above.
+        # Except just after a respawn, when the attitude being read is a drone
+        # bouncing on its landing gear rather than one in trouble.
+        if rospy.Time.now() < self._settle_until:
+            self._cmd_pub.publish(cmd)
+            return
+
+        if self._lost():
+            self._rescue()
+            return
+
+        # TRAFFIC ---------------------------------------------------------
+        # Checked before any phase builds a command, and after the rescue
+        # check, so that giving way applies to transiting, descending and
+        # climbing alike. TAKEOFF is exempt: an aircraft on the ground is not
+        # a hazard to anybody and cannot get out of the way in any case.
+        if self._state != 'TAKEOFF':
+            other, gap = self._traffic_conflict()
+            if other is not None:
+                if not self._yielding:
+                    rospy.loginfo('[%s] giving way to %s, %.2f m', self._ns,
+                                  other, gap)
+                    self._yield_began = rospy.Time.now()
+                self._yielding = True
+                self._cmd_pub.publish(self._give_way(cmd, other))
+                return
+            if self._yielding:
+                # Time spent giving way is not time spent failing to converge,
+                # so hand it back to the descent timeout rather than letting
+                # good manners cost the aircraft its parcel.
+                if self._descend_since is not None and self._yield_began:
+                    self._descend_since += rospy.Time.now() - self._yield_began
+                self._yielding = False
+                self._yield_z = None
+                self._yield_began = None
+
+        # TAKEOFF ---------------------------------------------------------
+        if self._state == 'TAKEOFF':
+            error = self._cruise_alt - self._z
+            if abs(error) < 0.15:
+                self._state = 'WAIT'
+                self._wait_ticks = 2
+                rospy.loginfo('[%s] airborne at %.2f m - on task', self._ns, self._z)
+            cmd.linear.z = _clamp(1.0 * error, -self._vert_speed, self._vert_speed)
+            self._cmd_pub.publish(cmd)
+            return
+
+        if self._parcel is None or (self._awaiting and self._state != 'CLIMB'):
+            # Airborne with nothing to fly at: between a delivery and the next
+            # assignment, waiting on a verdict, or more parcels claimed than
+            # there are aircraft. Hold cruise altitude rather than publishing an
+            # empty Twist, which commands zero velocity and lets the drone sink
+            # - see the note in DESCEND.
+            self._state = 'IDLE'
+            cmd.linear.z = _clamp(1.0 * (self._cruise_alt - self._z),
+                                  -self._vert_speed, self._vert_speed)
+            self._cmd_pub.publish(cmd)
+            return
+
+        # CLIMB -----------------------------------------------------------
+        # Get back up before flying anywhere. Checked before the geofence and
+        # before any horizontal command is built, because the whole point is
+        # that nothing else happens until the aircraft has its height back.
+        if self._state == 'CLIMB':
+            error = self._cruise_alt - self._z
+            cmd.linear.z = _clamp(1.0 * error, -self._vert_speed, self._vert_speed)
+            if abs(error) <= self._climb_tol:
+                self._state = 'ALIGN'
+            self._cmd_pub.publish(cmd)
+            return
+
+        # Soft geofence. Outside it, the middle of the yard becomes the goal
+        # and the parcel waits - a drone drifting toward the wall it is about
+        # to be upset by should not still be working a delivery. The parcel is
+        # not given back: it is still this drone\'s job, and it may well still
+        # be hanging underneath it.
+        if self._outside_fence():
+            tx, ty = 0.0, 0.0
+            self._fenced = True
+            rospy.logwarn_throttle(
+                5.0, '[%s] outside the fence at (%.1f, %.1f) - returning'
+                % (self._ns, self._x, self._y))
+        else:
+            self._fenced = False
+            tx, ty = self._goal()
+
+        dx = tx - self._x
+        dy = ty - self._y
+        dist_xy = math.hypot(dx, dy)
+
+        # Altitude is driven in every flying state, because it is independent
+        # of heading and there is no reason to give up height while turning.
+        # Cruise everywhere except DESCEND, which overrides this below - both
+        # ends of the job are on the ground, so there is no per-goal altitude
+        # to track on the way there.
+        cmd.linear.z = _clamp(1.0 * (self._cruise_alt - self._z),
+                              -self._vert_speed, self._vert_speed)
+
+        # WAIT ------------------------------------------------------------
+        if self._state == 'WAIT':
+            self._wait_ticks -= 1
+            if self._wait_ticks <= 0:
+                self._state = 'ALIGN'
+            self._cmd_pub.publish(cmd)
+            return
+
+        # DESCEND / ACT ---------------------------------------------------
+        # Overhead the goal: hold station over it and come down, then do the
+        # thing this leg exists for. Entered from CHASE, and left by the action
+        # succeeding, by drifting off the goal, or by the timeout.
+        if self._state in ('DESCEND', 'ACT') or (self._state == 'CHASE' and
+                                                 not self._fenced and
+                                                 dist_xy <= self._arrive_rad):
+            # Do not drop into an occupied depot. Hold station over the goal at
+            # this aircraft's own transit layer instead, where it is separated
+            # from every other by construction, and go down when the depot is
+            # free. This is the piece the altitude layers cannot do for
+            # themselves: they separate transits perfectly and then all meet at
+            # the descent.
+            if self._state != 'ACT' and not self._descent_clear():
+                self._state = 'HOLD'
+                self._descend_since = None
+                bx = dx * math.cos(self._yaw) + dy * math.sin(self._yaw)
+                by = -dx * math.sin(self._yaw) + dy * math.cos(self._yaw)
+                cmd.linear.x = _clamp(self._stn_gain * bx,
+                                      -self._stn_speed, self._stn_speed)
+                cmd.linear.y = _clamp(self._stn_gain * by,
+                                      -self._stn_speed, self._stn_speed)
+                rospy.loginfo_throttle(
+                    5.0, '[%s] holding at %.1f m - depot busy' %
+                    (self._ns, self._cruise_alt))
+                self._cmd_pub.publish(cmd)
+                return
+
+            if self._state != 'DESCEND':
+                self._state = 'DESCEND'
+            if self._descend_since is None:
+                self._descend_since = rospy.Time.now()
+
+            if dist_xy > 2.0 * self._arrive_rad:
+                # Blown off the goal. Climbing first rather than chasing at
+                # working height keeps the transit rules honest - and with a
+                # box slung underneath, crossing the yard at 0.31 m is how a
+                # parcel gets dragged through a crate.
+                self._descend_since = None
+                self._state = 'CLIMB'
+                self._cmd_pub.publish(cmd)
+                return
+
+            # A descent that will not converge has to end, or the parcel is
+            # claimed forever and no other aircraft is ever offered it. This
+            # is the only route by which a courier gives a job back.
+            if (rospy.Time.now() - self._descend_since).to_sec() > self._act_timeout:
+                self._abandon('descent did not converge in %.0f s'
+                              % self._act_timeout)
+                self._cmd_pub.publish(cmd)
+                return
+
+            centred = dist_xy <= self._grasp_tol
+            at_height = abs(self._z - self._work_alt) <= self._grasp_z_tol
+
+            # Two levels, not one. Off-centre the aircraft actively holds a
+            # hover altitude above the box while it centres; centred, it comes
+            # down the last stretch to the working altitude. Sinking onto a box
+            # you are 5 cm off is how you knock it across the yard, and on the
+            # delivery leg it is how a box ends up on its corner.
+            #
+            # The hover leg has to be a commanded *altitude*, not a commanded
+            # zero rate, and that distinction cost a whole run to find.
+            # controller/twist closes its loop on velocity and nothing in the
+            # stack closes one on position, so linear.z = 0 is not "hold this
+            # height" - it is "stop climbing", and the aircraft sinks at about
+            # a centimetre a second underneath it. Off-centre for twenty
+            # seconds is twenty centimetres of altitude quietly given away,
+            # which puts the drone below the grasp window it is trying to hit
+            # and, since nothing brings it back up while it is still
+            # off-centre, out of the running for good. Measured: three drones,
+            # 189 seconds in DESCEND between them, no grasps at all.
+            target_z = (self._work_alt if centred
+                        else self._work_alt + self._hover_margin)
+            target_z = max(target_z, self._min_alt)
+            cmd.linear.z = _clamp(1.0 * (target_z - self._z),
+                                  -self._vert_speed, self._vert_speed)
+
+            # Station-keeping, in the body frame. The world-frame error is
+            # rotated by yaw because /cmd_vel is body-stabilized; this is the
+            # one phase that commands lateral velocity, and translating
+            # sideways is exactly what makes the laser sectors meaningless.
+            bx = dx * math.cos(self._yaw) + dy * math.sin(self._yaw)
+            by = -dx * math.sin(self._yaw) + dy * math.cos(self._yaw)
+            cmd.linear.x = _clamp(self._stn_gain * bx,
+                                  -self._stn_speed, self._stn_speed)
+            cmd.linear.y = _clamp(self._stn_gain * by,
+                                  -self._stn_speed, self._stn_speed)
+
+            if centred and at_height:
+                self._cmd_pub.publish(cmd)
+                self._act()
+                return
+
+            self._cmd_pub.publish(cmd)
+            return
+
+        target_angle = math.atan2(dy, dx)
+        angle_err = _normalize_angle(target_angle - self._yaw)
+
+        # ALIGN -----------------------------------------------------------
+        if self._state == 'ALIGN':
+            if abs(angle_err) <= self._angle_tol:
+                self._state = 'CHASE'
+            else:
+                cmd.angular.z = _clamp(self._ang_gain * angle_err,
+                                       -self._max_ang, self._max_ang)
+                self._cmd_pub.publish(cmd)
+                return
+
+        # CHASE -----------------------------------------------------------
+        # Drop back to ALIGN if the heading has drifted badly - but not while
+        # avoiding, and not for avoid_hold afterwards. The safety filter yaws
+        # deliberately off-target, and tb3_treasure's unconditional version of
+        # this check would read that as drift, hand control to ALIGN, and turn
+        # straight back into the pillar the filter had just steered around.
+        #
+        # Suppressing it only while the filter is *currently* triggered is not
+        # enough, and the reason is that clearing the front sector is the one
+        # thing a successful deflection guarantees. The drone turns off the
+        # pillar, the sector clears, this check fires on the same tick, ALIGN
+        # takes over and yaws it straight back, and the pillar is in front
+        # again - now with no forward motion to show for it, because ALIGN does
+        # not translate. That is a livelock, not a wobble: a drone 2.5 m from
+        # its target ping-ponged ALIGN/CHASE for the last 90 seconds of a run
+        # and finished with two collections against another drone's twelve.
+        # The hold buys enough committed forward flight - about 0.9 m at cruise
+        # for every second of it - to actually pass the thing, which is a
+        # slightly longer lateral offset than a tree plus a rotor span.
+        if (abs(angle_err) > 2.0 * self._angle_tol and
+                rospy.Time.now() >= self._avoid_until):
+            self._state = 'ALIGN'
+            self._cmd_pub.publish(cmd)
+            return
+
+        speed_factor = (max(0.3, dist_xy / self._slow_dist)
+                        if dist_xy < self._slow_dist else 1.0)
+
+        # Body-frame forward. hector rotates this by the current yaw itself -
+        # see "Which frame /cmd_vel is in" at the top of this file - so flying
+        # along the heading is what commanding x alone already means.
+        cmd.linear.x = self._lin_speed * speed_factor
+        cmd.linear.y = 0.0
+        cmd.angular.z = _clamp(self._ang_gain * angle_err,
+                               -self._max_ang, self._max_ang)
+
+        cmd = self._safety_filter(cmd)
+
+        self._cmd_pub.publish(cmd)
+
+
+    # ---------------------------------------------------------- the action --
+    def _act(self):
+        """Do the thing this leg exists for: grasp, or release.
+
+        Called once the aircraft is both centred and at working height. On the
+        pickup leg a successful weld switches the goal to the far address and
+        the same four phases run again; on the delivery leg the release is the
+        end of this node\'s involvement, and the parcel is not counted until
+        the dispatcher has looked at where the box actually came to rest.
+        """
+        self._state = 'ACT'
+
+        if self._leg == 'PICKUP':
+            if self._grasp():
+                self._descend_since = None
+                self._state = 'CLIMB'
+            else:
+                self._abandon('could not weld the box on')
+            return
+
+        # DELIVERY. Release, then climb off it. The box is left exactly where
+        # it was welded, which is why the descent had to be centred: the
+        # dispatcher measures the landing against the depot, not against the
+        # drone\'s opinion of where it is.
+        self._release()
+        self._report(Parcel.DELIVERED)
+        self._descend_since = None
+        # The parcel is deliberately not cleared here, and the aircraft stops
+        # working it until the dispatcher rules. The box is down, but whether
+        # that counts is measured against the depot rather than against this
+        # node\'s opinion - and if it does not count, the job comes straight
+        # back as a fresh pickup, quite possibly to this same aircraft.
+        #
+        # Without the wait the courier would climb, re-align on a goal that is
+        # now a *pickup* (because it is no longer holding anything), fly back
+        # down onto the box it has just delivered and collect it again.
+        self._awaiting = True
+        self._state = 'CLIMB'
+
+
+def main():
+    Courier()
+    rospy.spin()
+
+
+if __name__ == '__main__':
+    main()

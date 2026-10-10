@@ -1,0 +1,638 @@
+#!/usr/bin/env python3
+"""
+make_city - generate the city the couriers deliver into, and the keep-out list
+that has to agree with it.
+
+Writes three files that must never disagree:
+
+  worlds/city_block.world       what Gazebo shows the drones
+  config/city_obstacles.yaml    where the dispatcher may not put an address
+  config/city_geometry.yaml     exact solids, for measuring real clearance
+
+They agree because they come out of one pass of one loop. That is the whole
+reason this script exists. delivery.launch used to carry the obstacle list
+inline, as eight hand-typed triples, under a comment that said in as many words
+"keep in step with worlds/depot_yard.world - nothing checks". With eight crates
+on a symmetric ring that was survivable. With a city of fifteen buildings it is
+not: every building is a number typed twice, and the failure mode of getting one
+wrong is not a crash but a customer address inside a wall, which looks like a
+courier that cannot land.
+
+The constraint that governs the layout
+--------------------------------------
+This is a delivery scenario, so the question a city has to answer is not "does
+it look like a city" but "can a parcel still be delivered anywhere". The
+dispatcher draws addresses at random and rejects any point closer than
+
+    building_radius + retrieve_clearance          (1.6 m)
+
+to a building centre, because a box that comes to rest against a wall is inside
+the descending courier's laser stop distance and costs a rescue rather than a
+delivery. So street width is not a cosmetic choice. With square buildings of
+side s the circumscribed radius is s*sqrt(2)/2, and the middle of a street
+between two of them is BLOCK_PITCH/2 from each, which gives the whole layout in
+one inequality:
+
+    BLOCK_PITCH / 2  >  s * sqrt(2)/2 + 1.6
+
+At the numbers below that is 4.5 > 3.86, a margin of 0.64 m of legal address
+either side of every street centreline. Narrow the streets or fatten the
+buildings and the city quietly becomes undeliverable - so this script measures
+the legal area afterwards and says what it found, rather than trusting the
+arithmetic above.
+
+Why the buildings are tall and thin
+-----------------------------------
+The couriers cruise at 1.2, 1.9 and 2.6 m, in three stacked layers. Against 3 m
+crates no layer could climb over an obstacle, and that invariant is what makes
+the laser matter; every building here is at least 4 m, so it still holds. Making
+them 4 to 12 m instead of exactly 3 costs nothing and turns the streets into
+urban canyons that the aircraft fly along rather than a field of blocks they fly
+between.
+
+What is solid, and what is paint
+--------------------------------
+Buildings, trees and the boundary wall have collision. Roads, kerbs, markings,
+crossings, pavements and the park lawn are flat visuals a couple of millimetres
+proud of the ground - they are what makes it read as a city, and none of them
+should ever stop a drone or catch a landing parcel.
+
+The rule the whole file turns on is that those two sets are decided in one
+place: anything given a collision shape here also gets an entry in the obstacle
+list, in the same loop, a few lines later. A tree Gazebo can collide with but
+the dispatcher does not know about is a doorstep under a canopy, and the
+courier sent to it does not come back.
+"""
+
+import argparse
+import math
+import os
+import random
+
+
+YARD_HALF = 16.0        # the boundary wall, unchanged from depot_yard.world
+BLOCK_PITCH = 9.0       # street grid spacing; see the inequality above
+BUILD_MAX = 3.2         # largest building footprint, m
+BUILD_MIN = 2.6
+ROAD_W = 5.4            # asphalt width; BLOCK_PITCH - BUILD_MAX rounded down
+HEIGHT = (4.0, 12.0)
+RETRIEVE_CLEAR = 1.6    # must match ~retrieve_clearance in delivery.launch
+
+WAREHOUSE = (-12.5, -12.5)
+WH_HALF = 1.2
+
+# Building centres: four columns and four rows on the block pitch, centred on
+# the origin. The south-west cell is the depot and gets no building.
+AXIS = [-13.5, -4.5, 4.5, 13.5]
+
+FACADES = [
+    ((0.55, 0.54, 0.52), (0.78, 0.77, 0.74)),   # concrete
+    ((0.38, 0.22, 0.17), (0.62, 0.34, 0.26)),   # brick
+    ((0.24, 0.30, 0.34), (0.42, 0.53, 0.60)),   # glass curtain wall
+    ((0.50, 0.45, 0.34), (0.80, 0.73, 0.56)),   # sandstone
+    ((0.30, 0.32, 0.36), (0.52, 0.55, 0.60)),   # dark panel
+]
+
+
+# Paint layers, in millimetres above the ground plane. These have to be named
+# constants rather than literals sprinkled through the code, and the pose has to
+# be written with enough precision to keep them apart: the first version of this
+# file formatted every pose with %.3f, which silently rounded 0.0008 and 0.0013
+# to the same 0.001 and left the pavement z-fighting with the road. The
+# pavement lost, so the block interiors rendered as more asphalt and the street
+# grid was invisible - a layout bug that looked exactly like a design choice.
+Z_PAVE = 0.0010
+Z_ROAD = 0.0010     # never overlaps the pavement in x/y, so it may share a layer
+Z_PARK = 0.0014
+Z_KERB = 0.0030
+Z_MARK = 0.0035     # dashes and crossings, on top of the carriageway
+Z_APRON = 0.0040    # the depot, on top of its own pavement pad
+Z_APRON_EDGE = 0.0050
+
+
+def box(name, x, y, z, sx, sy, sz, amb, dif, collide=True, emis=None):
+    """One static model. Collision is optional because most of a city is paint."""
+    col = ''
+    if collide:
+        col = ('        <collision name="c"><geometry><box><size>%.3f %.3f %.3f'
+               '</size></box></geometry></collision>\n' % (sx, sy, sz))
+    em = ''
+    if emis:
+        em = '<emissive>%.2f %.2f %.2f 1</emissive>' % emis
+    return (
+        '    <model name="%s">\n'
+        '      <static>true</static><pose>%.4f %.4f %.4f 0 0 0</pose>\n'
+        '      <link name="link">\n'
+        '%s'
+        '        <visual name="v"><geometry><box><size>%.3f %.3f %.3f</size></box></geometry>\n'
+        '          <material><ambient>%.2f %.2f %.2f 1</ambient>'
+        '<diffuse>%.2f %.2f %.2f 1</diffuse>%s</material></visual>\n'
+        '      </link>\n'
+        '    </model>\n'
+        % (name, x, y, z, col, sx, sy, sz,
+           amb[0], amb[1], amb[2], dif[0], dif[1], dif[2], em))
+
+
+class Building(object):
+    """A tower on one block, plus the circle the dispatcher must avoid."""
+
+    def __init__(self, rng, name, x, y):
+        self.name = name
+        self.x, self.y = x, y
+        self.w = rng.uniform(BUILD_MIN, BUILD_MAX)
+        self.d = rng.uniform(BUILD_MIN, BUILD_MAX)
+        self.h = rng.uniform(*HEIGHT)
+        self.amb, self.dif = rng.choice(FACADES)
+        self.floors = max(1, int(self.h / 1.6))
+        # The exact circumscribed radius of the footprint. Not an estimate: the
+        # dispatcher's obstacle model is a circle, so anything smaller than this
+        # would leave a corner of the building inside legal address space.
+        self.radius = math.hypot(self.w, self.d) / 2.0
+
+    def models(self):
+        out = [box(self.name, self.x, self.y, self.h / 2.0,
+                   self.w, self.d, self.h, self.amb, self.dif)]
+        # Window rows: thin collars a few centimetres proud of the facade, warm
+        # and lit. Visual only, and inside the building's own footprint plus
+        # 4 cm, so they change nothing about what can be hit.
+        #
+        # Kept deliberately thin. At 0.28 m they read as floor slabs and the
+        # tower looks like a stack of pancakes; at 0.14 m against a 1.6 m storey
+        # the proportion is roughly a real ribbon window and it reads as a
+        # building with lights on.
+        for f in range(1, self.floors):
+            z = f * (self.h / self.floors)
+            if z > self.h - 0.4:
+                break
+            out.append(box('%s_win%d' % (self.name, f), self.x, self.y, z,
+                           self.w + 0.04, self.d + 0.04, 0.14,
+                           (0.30, 0.28, 0.20), (0.72, 0.66, 0.46),
+                           collide=False, emis=(0.30, 0.26, 0.15)))
+        return out
+
+
+def cylinder(name, x, y, z, r, h, amb, dif, collide=True):
+    col = ''
+    if collide:
+        col = ('        <collision name="c"><geometry><cylinder><radius>%.3f'
+               '</radius><length>%.3f</length></cylinder></geometry>'
+               '</collision>\n' % (r, h))
+    return (
+        '    <model name="%s">\n'
+        '      <static>true</static><pose>%.4f %.4f %.4f 0 0 0</pose>\n'
+        '      <link name="link">\n'
+        '%s'
+        '        <visual name="v"><geometry><cylinder><radius>%.3f</radius>'
+        '<length>%.3f</length></cylinder></geometry>\n'
+        '          <material><ambient>%.2f %.2f %.2f 1</ambient>'
+        '<diffuse>%.2f %.2f %.2f 1</diffuse></material></visual>\n'
+        '      </link>\n'
+        '    </model>\n'
+        % (name, x, y, z, col, r, h,
+           amb[0], amb[1], amb[2], dif[0], dif[1], dif[2]))
+
+
+def sphere(name, x, y, z, r, amb, dif, collide=True):
+    col = ''
+    if collide:
+        col = ('        <collision name="c"><geometry><sphere><radius>%.3f'
+               '</radius></sphere></geometry></collision>\n' % r)
+    return (
+        '    <model name="%s">\n'
+        '      <static>true</static><pose>%.4f %.4f %.4f 0 0 0</pose>\n'
+        '      <link name="link">\n'
+        '%s'
+        '        <visual name="v"><geometry><sphere><radius>%.3f</radius>'
+        '</sphere></geometry>\n'
+        '          <material><ambient>%.2f %.2f %.2f 1</ambient>'
+        '<diffuse>%.2f %.2f %.2f 1</diffuse></material></visual>\n'
+        '      </link>\n'
+        '    </model>\n'
+        % (name, x, y, z, col, r,
+           amb[0], amb[1], amb[2], dif[0], dif[1], dif[2]))
+
+
+class Tree(object):
+    """A street tree, shaped by what a 2D laser on a mast can actually see.
+
+    Three numbers decide whether a tree is an obstacle the couriers handle or
+    one they fly into, and none of them are aesthetic.
+
+    Trunk thickness. The Hokuyo is 181 rays over 270 degrees, so 1.5 degrees
+    apart. A 0.10 m trunk at 4 m subtends 1.4 degrees and can fall clean between
+    two rays; at TRUNK_R it subtends 3.4 degrees at 4 m and 11 at the 1.6 m
+    avoidance range, which is four to seven rays. Thin ornamental trunks are the
+    one shape this sensor can miss, so these are deliberately stout.
+
+    Trunk continuity. The scan plane sits 0.25 m above base_link and nothing on
+    the airframe is above +0.04, so the laser always looks slightly over the top
+    of what the aircraft can hit. That is safe for a solid object and unsafe for
+    one with a gap at scan height - the classic 2D-lidar table leg problem. A
+    tree is safe because the trunk runs unbroken from the ground to the canopy:
+    at any altitude below the leaves there is trunk at both the airframe's
+    height and the scan's.
+
+    Canopy base. CANOPY_Z0 is under the top cruise layer (2.6 m) and over the
+    middle one (1.9 m). So uav_2 meets the canopy head-on and sees it - its scan
+    at 2.85 m is inside the foliage - while uav_0 and uav_1 pass beneath it and
+    only ever see trunk. That is intentional: it gives the top layer a real
+    obstacle to avoid rather than three layers all solving the same trunk.
+    """
+
+    TRUNK_R = 0.12          # 0.24 m thick; see the ray-spacing note above
+    CANOPY_Z0 = 2.40        # foliage starts here, above uav_1 and below uav_2
+    CANOPY_R = 0.75
+
+    BARK = ((0.20, 0.15, 0.10), (0.36, 0.27, 0.18))
+    LEAF = ((0.12, 0.24, 0.10), (0.24, 0.46, 0.20))
+
+    def __init__(self, rng, name, x, y):
+        self.name = name
+        self.x, self.y = x, y
+        self.canopy_r = self.CANOPY_R * rng.uniform(0.88, 1.10)
+        self.top = self.CANOPY_Z0 + self.canopy_r * rng.uniform(1.5, 2.0)
+        # The circle the dispatcher must keep addresses out of. The canopy, not
+        # the trunk: a box set down under the leaves is a box a courier has to
+        # descend through foliage to reach.
+        self.radius = self.canopy_r
+
+    def models(self):
+        trunk_h = self.CANOPY_Z0 + 0.3
+        out = [cylinder('%s_trunk' % self.name, self.x, self.y, trunk_h / 2.0,
+                        self.TRUNK_R, trunk_h, self.BARK[0], self.BARK[1])]
+        # Two overlapping spheres rather than one: a single ball on a stick
+        # reads as a lollipop, and the collision shape wants to be roughly the
+        # silhouette the laser sees anyway.
+        mid = (self.CANOPY_Z0 + self.top) / 2.0
+        out.append(sphere('%s_crown' % self.name, self.x, self.y, mid,
+                          self.canopy_r, self.LEAF[0], self.LEAF[1]))
+        out.append(sphere('%s_crown2' % self.name, self.x, self.y,
+                          mid + self.canopy_r * 0.55,
+                          self.canopy_r * 0.72, self.LEAF[0], self.LEAF[1]))
+        return out
+
+
+def roads():
+    """Asphalt, kerbs and markings. All flat, none of it collidable."""
+    out = []
+    streets = [-BLOCK_PITCH, 0.0, BLOCK_PITCH]
+    span = 2.0 * YARD_HALF
+    dark = ((0.13, 0.13, 0.14), (0.22, 0.22, 0.24))
+    kerb = ((0.42, 0.42, 0.44), (0.68, 0.68, 0.70))
+    paint = ((0.60, 0.60, 0.55), (0.95, 0.95, 0.90))
+
+    for i, s in enumerate(streets):
+        out.append(box('road_ns_%d' % i, s, 0.0, Z_ROAD,
+                       ROAD_W, span, 0.002, dark[0], dark[1], collide=False))
+        out.append(box('road_ew_%d' % i, 0.0, s, Z_ROAD,
+                       span, ROAD_W, 0.002, dark[0], dark[1], collide=False))
+        # Kerbs: a pale stripe down each side of the carriageway. Painted on
+        # rather than raised, because a 10 cm kerb is exactly the sort of thing
+        # a released parcel rolls against and then cannot be collected from.
+        for side in (-1, 1):
+            e = s + side * ROAD_W / 2.0
+            out.append(box('kerb_ns_%d_%d' % (i, side), e, 0.0, Z_KERB,
+                           0.16, span, 0.002, kerb[0], kerb[1], collide=False))
+            out.append(box('kerb_ew_%d_%d' % (i, side), 0.0, e, Z_KERB,
+                           span, 0.16, 0.002, kerb[0], kerb[1], collide=False))
+
+    # Dashed centre lines, broken at the intersections so the junctions read as
+    # junctions.
+    n = 0
+    for s in streets:
+        y = -YARD_HALF
+        while y < YARD_HALF:
+            if all(abs(y - c) > ROAD_W / 2.0 + 0.4 for c in streets):
+                out.append(box('dash_ns_%d' % n, s, y, Z_MARK,
+                               0.14, 0.9, 0.002, paint[0], paint[1],
+                               collide=False))
+                n += 1
+            y += 1.8
+        x = -YARD_HALF
+        while x < YARD_HALF:
+            if all(abs(x - c) > ROAD_W / 2.0 + 0.4 for c in streets):
+                out.append(box('dash_ew_%d' % n, x, s, Z_MARK,
+                               0.9, 0.14, 0.002, paint[0], paint[1],
+                               collide=False))
+                n += 1
+            x += 1.8
+
+    # Zebra crossings on the approaches to the middle junction.
+    n = 0
+    for sx, sy, horiz in ((0.0, 4.0, True), (0.0, -4.0, True),
+                          (4.0, 0.0, False), (-4.0, 0.0, False)):
+        for k in range(-2, 3):
+            if horiz:
+                out.append(box('zebra_%d' % n, sx + k * 0.75, sy, Z_MARK,
+                               0.42, 2.2, 0.002, paint[0], paint[1],
+                               collide=False))
+            else:
+                out.append(box('zebra_%d' % n, sx, sy + k * 0.75, Z_MARK,
+                               2.2, 0.42, 0.002, paint[0], paint[1],
+                               collide=False))
+            n += 1
+    return out
+
+
+def pavement(cells, park_cell):
+    """A pale pad filling each block between the carriageways.
+
+    Without these the block interiors are bare ground plane in the same grey as
+    the asphalt, and from the air the whole yard reads as one continuous car
+    park with white lines painted on it. The streets only become streets when
+    the thing between them is visibly not a street.
+
+    Sized to the gap the roads leave - BLOCK_PITCH less the carriageway - so the
+    kerb stripe lands on the join rather than floating in the road.
+    """
+    side = BLOCK_PITCH - ROAD_W
+    out = []
+    for i, (x, y) in enumerate(cells):
+        if (x, y) == park_cell:
+            continue
+        # Below the depot apron (0.001) rather than above it: the depot block
+        # gets a pad like every other, and the apron and its yellow edges are
+        # painted on top of it. At 0.0013 the pad covered the apron completely
+        # and the hub disappeared under the pavement.
+        out.append(box('pavement_%02d' % i, x, y, Z_PAVE, side, side, 0.002,
+                       (0.44, 0.43, 0.41), (0.70, 0.69, 0.66), collide=False))
+    return out
+
+
+def park(x, y):
+    """One block given over to grass instead of a tower. The lawn is flat paint;
+    the trees on it are real and are returned separately, because anything with
+    a collision shape has to reach the obstacle list."""
+    return [box('park_lawn', x, y, Z_PARK, 3.8, 3.8, 0.002,
+                (0.16, 0.28, 0.12), (0.28, 0.48, 0.20), collide=False)]
+
+
+def plant_trees(rng, cells, park_cell, depot_cell):
+    """Where the trees go, and why not everywhere.
+
+    Every tree is an obstacle, and every obstacle removes a disc of
+    canopy_radius + 1.6 m from the space the dispatcher can address. Lining all
+    six streets would look best and would leave almost nothing deliverable, so
+    the planting is deliberately sparse and measured afterwards.
+
+    Two kinds:
+
+      park trees   a clump on the lawn, which is the one block with no building
+                   and so the one place a cluster costs nothing extra
+      street trees one per selected block, set on the kerb line facing the
+                   carriageway - TREE_INSET from the block centre, which is
+                   exactly the pavement edge, so they stand beside the road
+                   rather than in it
+
+    Set on the kerb, a tree is ROAD_W/2 = 2.7 m from the street centreline
+    against a keep-out of about 2.35 m, so the middle of every street stays
+    addressable and, more importantly, stays flyable: the couriers' avoidance
+    triggers at 1.6 m, and a drone tracking the centreline has 2.7 m of
+    clearance and never reacts to a tree it is merely passing.
+    """
+    inset = BLOCK_PITCH / 2.0 - ROAD_W / 2.0        # 1.8 m: the pavement edge
+    trees = []
+
+    # The park clump.
+    for i, (dx, dy) in enumerate(((-1.1, -1.0), (1.2, -0.9), (0.0, 1.2))):
+        trees.append(Tree(rng, 'tree_park_%d' % i,
+                          park_cell[0] + dx, park_cell[1] + dy))
+
+    # Street trees. Every other block, so the streets are punctuated rather
+    # than walled, and never on the depot block - the hub is the one place all
+    # three aircraft descend into and it stays clear.
+    plantable = [c for c in cells if c != park_cell and c != depot_cell]
+    for i, (cx, cy) in enumerate(plantable):
+        if i % 2:
+            continue
+        # Face the tree at the nearest street rather than a fixed corner, so a
+        # block on the outside of the grid does not plant into the boundary wall.
+        sx = -inset if cx > 0 else inset
+        sy = -inset if cy > 0 else inset
+        trees.append(Tree(rng, 'tree_st_%d' % i, cx + sx, cy + sy))
+
+    return trees
+
+
+def depot():
+    """The warehouse apron, carried over from depot_yard.world unchanged.
+
+    It is a marking and not a building on purpose: a roof over the one place all
+    three aircraft descend into on every single job would take the hub out of
+    the usable airspace.
+    """
+    x, y = WAREHOUSE
+    slab = ((0.16, 0.16, 0.19), (0.30, 0.32, 0.36))
+    edge = ((0.35, 0.30, 0.05), (0.95, 0.80, 0.10))
+    out = [box('warehouse_apron', x, y, Z_APRON, 2.4, 2.4, 0.002,
+               slab[0], slab[1], collide=False, emis=(0.09, 0.09, 0.11))]
+    for name, ox, oy, sx, sy in (('n', 0.0, 1.15, 2.4, 0.12),
+                                 ('s', 0.0, -1.15, 2.4, 0.12),
+                                 ('e', 1.15, 0.0, 0.12, 2.64),
+                                 ('w', -1.15, 0.0, 0.12, 2.64)):
+        out.append(box('warehouse_edge_%s' % name, x + ox, y + oy, Z_APRON_EDGE,
+                       sx, sy, 0.002, edge[0], edge[1],
+                       collide=False, emis=(0.25, 0.21, 0.03)))
+    return out
+
+
+def walls():
+    amb, dif = (0.30, 0.30, 0.32), (0.50, 0.50, 0.54)
+    span = 2.0 * YARD_HALF + 0.2
+    return [
+        box('wall_north', 0, YARD_HALF, 1.5, span, 0.2, 3.0, amb, dif),
+        box('wall_south', 0, -YARD_HALF, 1.5, span, 0.2, 3.0, amb, dif),
+        box('wall_east', YARD_HALF, 0, 1.5, 0.2, span, 3.0, amb, dif),
+        box('wall_west', -YARD_HALF, 0, 1.5, 0.2, span, 3.0, amb, dif),
+    ]
+
+
+def legal_area(obstacles, cust_half, min_from_wh, samples=200):
+    """What fraction of the customer region is still a deliverable address?
+
+    The arithmetic in the header says the streets are wide enough. This checks
+    it against the buildings actually written, which is the only version that
+    matters - and it is the same idea as the orchard survey's visibility test:
+    a scenario that cannot be completed is a bug in the world, not in the robot,
+    and it is far cheaper to find here than from a courier circling a doorstep
+    it can never reach.
+    """
+    ok = 0
+    total = 0
+    step = 2.0 * cust_half / samples
+    for i in range(samples):
+        x = -cust_half + (i + 0.5) * step
+        for j in range(samples):
+            y = -cust_half + (j + 0.5) * step
+            if math.hypot(x - WAREHOUSE[0], y - WAREHOUSE[1]) < min_from_wh:
+                continue
+            total += 1
+            if all(math.hypot(x - ox, y - oy) >= r + RETRIEVE_CLEAR
+                   for ox, oy, r in obstacles):
+                ok += 1
+    return ok, total
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--seed', type=int, default=3)
+    ap.add_argument('--pkg', default=os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), '..'))
+    args = ap.parse_args()
+
+    rng = random.Random(args.seed)
+
+    # The block grid. The south-west cell is the depot, and one other is a park,
+    # so the city is not a perfectly regular lattice.
+    cells = [(x, y) for x in AXIS for y in AXIS]
+    depot_cell = (AXIS[0], AXIS[0])
+    cells.remove(depot_cell)
+    park_cell = rng.choice([c for c in cells
+                            if abs(c[0]) < 10 and abs(c[1]) < 10])
+
+    models = []
+    obstacles = []
+    solids = []          # exact geometry, for the clearance monitor
+    for i, (x, y) in enumerate(cells):
+        if (x, y) == park_cell:
+            continue
+        b = Building(rng, 'building_%02d' % i, x, y)
+        models.extend(b.models())
+        obstacles.append((b.x, b.y, b.radius))
+        solids.append(('box', b.x, b.y, b.w / 2.0, b.d / 2.0, 0.0, b.h))
+
+    trees = plant_trees(rng, cells, park_cell, depot_cell)
+    for t in trees:
+        models.extend(t.models())
+        # Same list as the buildings. A tree that Gazebo can collide with but
+        # the dispatcher does not know about is a doorstep under a canopy, and
+        # the courier that goes for it does not come back.
+        obstacles.append((t.x, t.y, t.radius))
+        # The trunk is what the aircraft actually meets at cruise altitude, so
+        # the monitor measures against that, not the canopy disc.
+        solids.append(('cyl', t.x, t.y, t.TRUNK_R, t.TRUNK_R, 0.0, t.top))
+
+    # The boundary wall is solid too, and has to be measurable. It is
+    # deliberately NOT in `obstacles`: addresses are drawn inside +-12 m and the
+    # courier has its own geofence, so the wall never needs to push a doorstep
+    # around - but an aircraft that hits one has still crashed, and a monitor
+    # that cannot see the walls would score that as a clean run.
+    for name, wx, wy, hx, hy in (('n', 0.0, YARD_HALF, YARD_HALF + 0.1, 0.1),
+                                 ('s', 0.0, -YARD_HALF, YARD_HALF + 0.1, 0.1),
+                                 ('e', YARD_HALF, 0.0, 0.1, YARD_HALF + 0.1),
+                                 ('w', -YARD_HALF, 0.0, 0.1, YARD_HALF + 0.1)):
+        solids.append(('box', wx, wy, hx, hy, 0.0, 3.0))
+
+    # Order matters only for readability of the file; z-offsets are what keep
+    # the paint layered correctly on the ground.
+    models = (roads() + pavement(cells + [depot_cell], park_cell)
+              + park(*park_cell) + depot() + models + walls())
+
+    world = os.path.join(args.pkg, 'worlds', 'city_block.world')
+    obs_yaml = os.path.join(args.pkg, 'config', 'city_obstacles.yaml')
+    if not os.path.isdir(os.path.dirname(obs_yaml)):
+        os.makedirs(os.path.dirname(obs_yaml))
+
+    header = (
+        '<?xml version="1.0"?>\n'
+        '<!-- GENERATED by scripts/make_city (seed %d). Do not edit by hand:\n'
+        '     config/city_obstacles.yaml is written from the same loop and the\n'
+        '     two have to agree. Change the city by editing make_city and\n'
+        '     running it again.\n'
+        '\n'
+        '     A %.0f x %.0f m city block grid: %d buildings on a %.1f m street\n'
+        '     pitch with %.1f m carriageways, one park, and the delivery depot\n'
+        '     in the south-west corner. Buildings are %.0f to %.0f m tall, so no\n'
+        '     cruise layer (1.2, 1.9, 2.6 m) can climb over one - every aircraft\n'
+        '     has to use its laser, which was also true of the crates this\n'
+        '     replaced.\n'
+        '\n'
+        '     Only the buildings and the boundary wall have collision. Roads,\n'
+        '     kerbs, markings, crossings and the park are flat visuals, so\n'
+        '     nothing that makes this look like a city can stop a drone or trap\n'
+        '     a released parcel.\n'
+        '\n'
+        '     The link attacher plugin below is the drones gripper and must\n'
+        '     stay: it serves /link_attacher_node/attach and /detach. -->\n'
+        % (args.seed, 2 * YARD_HALF, 2 * YARD_HALF, len(obstacles),
+           BLOCK_PITCH, ROAD_W, HEIGHT[0], HEIGHT[1]))
+
+    body = (
+        '<sdf version="1.6">\n'
+        '  <world name="default">\n\n'
+        '    <include><uri>model://sun</uri></include>\n'
+        '    <include><uri>model://ground_plane</uri></include>\n\n'
+        '    <plugin name="ros_link_attacher_plugin" '
+        'filename="libgazebo_ros_link_attacher.so" />\n\n'
+        '    <scene>\n'
+        '      <ambient>0.65 0.65 0.65 1</ambient>\n'
+        '      <background>0.7 0.8 0.9 1</background>\n'
+        '      <shadows>false</shadows>\n'
+        '    </scene>\n\n'
+        '    <physics type="ode">\n'
+        '      <max_step_size>0.001</max_step_size>\n'
+        '      <real_time_update_rate>1000</real_time_update_rate>\n'
+        '    </physics>\n\n'
+        + ''.join(models) +
+        '\n    <gui>\n'
+        '      <camera name="user_camera">\n'
+        '        <pose>-26 -26 22 0 0.55 0.785</pose>\n'
+        '      </camera>\n'
+        '    </gui>\n\n'
+        '  </world>\n'
+        '</sdf>\n')
+
+    with open(world, 'w') as fh:
+        fh.write(header + body)
+
+    with open(obs_yaml, 'w') as fh:
+        fh.write(
+            '# GENERATED by scripts/make_city (seed %d) alongside\n'
+            '# worlds/city_block.world. Do not edit by hand - the whole point\n'
+            '# of generating both from one loop is that a building cannot exist\n'
+            '# in Gazebo without the dispatcher knowing not to deliver into it.\n'
+            '#\n'
+            '# [x, y, radius] per building, radius being the exact circumscribed\n'
+            '# radius of the footprint. The dispatcher rejects any address, and\n'
+            '# any dropped-parcel recovery, within radius + ~retrieve_clearance\n'
+            '# (%.1f m) of one of these.\n'
+            'obstacles: [\n' % (args.seed, RETRIEVE_CLEAR))
+        for ox, oy, r in obstacles:
+            fh.write('  [%.3f, %.3f, %.3f],\n' % (ox, oy, r))
+        fh.write(']\n')
+
+    geo_yaml = os.path.join(args.pkg, 'config', 'city_geometry.yaml')
+    with open(geo_yaml, 'w') as fh:
+        fh.write(
+            '# GENERATED by scripts/make_city (seed %d). Exact collision\n'
+            '# geometry, for tools that need to measure real clearance rather\n'
+            '# than the conservative circles in city_obstacles.yaml.\n'
+            '#\n'
+            '# [kind, x, y, half_x/radius, half_y, z_min, z_max]. Buildings are\n'
+            '# boxes; trees are the trunk cylinder, because the trunk is what an\n'
+            '# aircraft meets at cruise altitude. NOT loaded by delivery.launch -\n'
+            '# the dispatcher wants the circles, not this.\n'
+            'solids:\n' % args.seed)
+        for kind, x, y, a, b, z0, z1 in solids:
+            fh.write('  - [%s, %.3f, %.3f, %.3f, %.3f, %.2f, %.2f]\n'
+                     % (kind, x, y, a, b, z0, z1))
+
+    ok, total = legal_area(obstacles, 12.0, 9.0)
+    pct = 100.0 * ok / max(total, 1)
+    print('city: %d buildings and %d trees on a %.1f m grid, %.1f m streets'
+          % (len(obstacles) - len(trees), len(trees), BLOCK_PITCH, ROAD_W))
+    print('  tallest %.1f m, shortest %.1f m'
+          % (max(HEIGHT), min(HEIGHT)))
+    print('  park at (%.1f, %.1f), depot at (%.1f, %.1f)'
+          % (park_cell[0], park_cell[1], WAREHOUSE[0], WAREHOUSE[1]))
+    print('  -> %s' % world)
+    print('  -> %s' % obs_yaml)
+    print('  -> %s' % geo_yaml)
+    print('  deliverable address space: %.1f%% of the customer region' % pct)
+    if pct < 25.0:
+        print('  WARNING: that is thin. Widen ROAD_W or shrink BUILD_MAX - '
+              'the dispatcher samples 400 times before giving up.')
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,159 @@
+<?xml version="1.0"?>
+<!-- The courier: hector's quadrotor with a laser on a mast above it and a
+     grasp pad hung underneath.
+
+     Neither half is new - the mast comes from uav_bushfire, the pad from
+     uav_pick_place - but putting both on one airframe is, and it is worth
+     saying why that is safe, because the two packages it comes from each warn
+     at length about payload inertia.
+
+     The controller reads mass and moment of inertia from Gazebo exactly once,
+     when it loads (quadrotor_hardware_gazebo.cpp, getMassAndInertia), and is
+     never told anything afterwards. The important distinction is therefore
+     between mass that is present at load time and mass that arrives later:
+
+       * The mast and its Hokuyo are in this URDF. Gazebo folds fixed-joint
+         children into base_link, so the lumped inertia the controller reads at
+         startup already includes them. The laser adds 0.27 kg at +0.25 m,
+         which is 0.0169 kg.m^2 about roll and pitch against the bare
+         airframe's 0.01152 - a 147% increase, and completely harmless, because
+         the controller multiplies its attitude PID output by the inertia it
+         read. Bigger inertia, proportionally bigger torque, same response.
+
+       * A box welded on at runtime is not in this URDF and never reaches the
+         controller. That inertia is invisible, so it is the only one that has
+         to be small. At 0.04 kg held 0.26 m below base_link it is 0.0027,
+         about 23% of the bare airframe - the figure uav_pick_place settled on
+         after a 0.15 kg box on a longer stem produced a sustained +-3 degree
+         roll limit cycle that never decayed and timed out every waypoint.
+
+     So the heavy thing above the aircraft is fine and the light thing below it
+     is the constraint, which is the opposite way round from what the masses
+     suggest. Raise the box mass in worlds/depot_yard.world and this stops
+     flying long before the thrust budget notices: force/z caps at 30 N against
+     a 14.5 N airframe, so there is about 1.5 kg of lift spare and none of it
+     is usable.
+
+     The mast is 0.25 m because a quadrotor pitches in order to translate.
+     Nothing on the airframe is above z = +0.04, so a shorter mast is clear
+     while hovering level and useless in flight: the rotor tips are 0.396 m
+     out, so 15 degrees of pitch swings the far side of the scan plane down
+     0.396*sin(15) = 0.10 m, straight through the rotor disc. Measured at
+     0.12 m, exactly that happened - the drone saw its own booms at 0.40 m the
+     moment it accelerated and decided it was walled in. 0.25 m keeps the plane
+     clear to about 32 degrees, which is where the courier's self_hit_tilt
+     comes from.
+
+     Rays are cut from hector's 1081 to 181 and the update rate from 40 Hz to
+     10 Hz: the courier only asks this scan for the minimum range in three wide
+     sectors, which 181 rays over 270 degrees resolves to about 1.5 degrees. -->
+<robot name="quadrotor" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:property name="M_PI" value="3.1415926535897931" />
+
+  <!-- How far the grasp plane sits below base_link. Keep in step with
+       ~grasp_reach in launch/one_uav.launch: the courier flies to
+       (box top + grasp_reach) to put the pad on a box, and every vertical
+       number in the pickup and delivery descents is derived from it. -->
+  <xacro:property name="grasp_reach" value="0.21" />
+
+  <xacro:include filename="$(find hector_quadrotor_description)/urdf/quadrotor_base.urdf.xacro" />
+  <xacro:quadrotor_base_macro />
+
+  <material name="courier_orange">
+    <color rgba="0.95 0.45 0.05 1.0" />
+  </material>
+  <material name="courier_grey">
+    <color rgba="0.25 0.25 0.28 1.0" />
+  </material>
+
+  <!-- ================================ mast ================================
+       Cosmetic - it gives the scanner something to visibly stand on - but a
+       real link with a real (tiny) mass, so the inertia the controller reads
+       at startup includes it. -->
+  <link name="laser_mast">
+    <inertial>
+      <mass value="0.01" />
+      <origin xyz="0 0 0" />
+      <inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="0.007" length="0.23" />
+      </geometry>
+      <material name="courier_grey" />
+    </visual>
+  </link>
+
+  <joint name="laser_mast_joint" type="fixed">
+    <parent link="base_link" />
+    <child  link="laser_mast" />
+    <origin xyz="0 0 0.135" rpy="0 0 0" />
+  </joint>
+
+  <xacro:include filename="$(find hector_sensors_description)/urdf/hokuyo_utm30lx.urdf.xacro" />
+  <xacro:hokuyo_utm30lx name="laser0" parent="base_link" ros_topic="scan"
+                        update_rate="10" ray_count="181"
+                        min_angle="-135" max_angle="135">
+    <origin xyz="0.0 0.0 0.25" rpy="0 0 0" />
+  </xacro:hokuyo_utm30lx>
+
+  <!-- =============================== gripper ==============================
+       A pad and a stem below the landing gear, marking where the drone picks
+       things up. Visual and inertial only, deliberately NO collision:
+       grasping here is a magnet rather than a hand - link_attacher welds the
+       box on with a fixed joint, so nothing is squeezed and no contact is
+       needed. A collision box would only give the descent a way to knock the
+       box out from under the aircraft before the weld lands.
+
+       0.21 m is set by the landing gear. The feet are the lowest part of the
+       airframe, a ring between z = -0.19 and z = -0.17 at radius 0.125-0.144.
+       A 0.10 m box held with its top face on the pad hangs from -0.21 to
+       -0.31, entirely below the feet with 0.02 m to spare. Lengthen the stem
+       and the drone flies worse for the m*d^2 reason above; shorten it past
+       0.19 and the aircraft stands on the box it is trying to collect. -->
+  <joint name="gripper_joint" type="fixed">
+    <parent link="base_link" />
+    <child  link="gripper_link" />
+    <origin xyz="0 0 ${-grasp_reach}" rpy="0 0 0" />
+  </joint>
+
+  <!-- gripper_link's origin IS the grasp plane, so both visuals sit at
+       positive z from it: the pad just above the origin, the stem above that,
+       reaching back up to the underside of the airframe at -0.05. -->
+  <link name="gripper_link">
+    <inertial>
+      <mass value="0.02" />
+      <origin xyz="0 0 0.05" />
+      <inertia ixx="1e-5" ixy="0.0" ixz="0.0" iyy="1e-5" iyz="0.0" izz="1e-5" />
+    </inertial>
+
+    <visual>
+      <origin xyz="0 0 0.01" rpy="0 0 0" />
+      <geometry>
+        <box size="0.09 0.09 0.02" />
+      </geometry>
+      <material name="courier_orange" />
+    </visual>
+
+    <visual>
+      <origin xyz="0 0 0.09" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="0.008" length="0.14" />
+      </geometry>
+      <material name="courier_grey" />
+    </visual>
+  </link>
+
+  <!-- Gazebo folds a fixed joint's child into its parent, so in the simulator
+       gripper_link's visuals become part of base_link and there is no separate
+       body by that name. That is what we want - a rigid pad, not a flapping
+       one - and it is why the courier welds boxes to base_link rather than to
+       gripper_link, which Gazebo would not be able to find. The link still
+       exists in the URDF, so robot_state_publisher puts a gripper_link frame
+       on TF where the pad actually is. -->
+
+  <xacro:include filename="$(find hector_quadrotor_gazebo)/urdf/quadrotor_plugins.gazebo.xacro" />
+
+</robot>

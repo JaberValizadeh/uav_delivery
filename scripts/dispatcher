@@ -1,0 +1,1232 @@
+#!/usr/bin/env python3
+"""
+dispatcher - the parcel book, and the despatcher that hands jobs to couriers.
+
+One of these runs for the whole yard. It owns every parcel, decides which drone
+gets which, and is the only thing in the system that declares a delivery to
+have happened.
+
+Exclusivity
+-----------
+"Each box is delivered by one UAV" is enforced in one field: Parcel.carrier. A
+parcel is assigned once, to one namespace, and that assignment is *sticky* -
+held until the box is on the ground at its destination or the courier gives it
+back. This is the opposite of the tasking in uav_bushfire, which recomputed
+nearest-first every tick and retasked freely, and the difference is not a
+preference. A fire is a place; abandoning one to fly at a nearer one costs
+nothing but the flying. A parcel is a commitment: halfway through the job the
+drone is holding the thing, and there is no useful sense in which another
+aircraft can take over. So assignment happens once, when the courier is empty
+and the parcel is on the ground, and after that the pairing is fixed.
+
+Idle drones are matched to waiting parcels nearest-first, greedily: every
+(drone, parcel) pair is scored by the distance from the drone to the *pickup*,
+shortest first, and both drop out of the running once matched.
+
+What counts as delivered
+------------------------
+Where the box actually is, read from /gazebo/model_states - not the courier's
+opinion. The courier reports when it has released, and that report is only the
+trigger to go and look; the parcel is marked delivered when the box is within
+~deliver_radius of the destination and low enough to be resting on the ground.
+
+That distinction earns its keep the moment anything goes wrong. A courier that
+releases early, gets bumped on the way down, or drops a box over the wrong
+depot believes it has delivered; the box says otherwise. A misdelivery is
+therefore not an error case needing special handling - the parcel simply
+returns to WAITING with its source updated to wherever the box came to rest,
+and the next idle drone is sent to fetch it from there.
+
+Boxes are moved, never respawned
+--------------------------------
+The pool of Gazebo models is fixed and spawned once. When a parcel is
+re-issued, its box is teleported to the new source with set_model_state rather
+than deleted and re-created. Gazebo answers spawn and delete immediately but
+defers both to a world update, so delete-then-spawn races itself: the spawn
+reports success, the next delete arrives before the insertion has happened,
+Gazebo answers "model does not exist", and the node is left believing there is
+no model while the pending insertion goes ahead anyway. Measured in a sibling
+package: 33 failed deletes in four and a half minutes and a target with no
+model in the world at all.
+
+Publications
+------------
+  /delivery/parcels        uav_delivery/ParcelArray        every parcel (10 Hz)
+  /delivery/markers        visualization_msgs/MarkerArray  RViz (latched)
+  /<ns>/delivery/task      uav_delivery/Parcel             that drone's job
+
+Subscriptions
+-------------
+  /gazebo/model_states     gazebo_msgs/ModelStates         where boxes really are
+  /<ns>/ground_truth/state nav_msgs/Odometry               per ns in ~drones
+  /delivery/report         uav_delivery/Parcel             courier progress
+
+ROS Parameters (private, ~)
+---------------------------
+  ~drones          list  Namespaces to task                    (default [])
+  ~num_parcels     int   Parcels in the system at once         (default 5)
+  ~customer_half   float Customers land within +-this, m       (default 12.0)
+  ~customer_min_from_warehouse float ...but no nearer the hub than
+                         this, so every job is a real transit   (default 9.0)
+  ~customer_gap    float Keep simultaneous addresses apart, m   (default 3.0)
+  ~grid_cell       float Size of an address grid square, m      (default 3.2)
+  ~delivered_dwell float How long a delivered parcel is left on
+                         the doorstep before it clears, s       (default 3.0)
+  ~address_blank   float Pause with no address at all, between
+                         one order clearing and the next, s     (default 0.8)
+  ~yard_half       float Half-width of the yard, for naming, m  (default 16.0)
+  ~warehouse       list  The single source, [name, x, y]       (default [WH,0,0])
+  ~apron_half      float Half-width of the loading apron, m    (default 1.8)
+  ~obstacles       list  [[x, y, radius], ...] a box cannot be
+                         collected from                        (default [])
+  ~retrieve_clearance float How close to an obstacle a dropped
+                         box may be and still be fetched, m    (default 1.6)
+  ~box_size        float Edge of a box, m                      (default 0.10)
+  ~box_mass        float Mass of a box, kg - see the airframe   (default 0.04)
+  ~deliver_radius  float Box must land within this of dst, m   (default 0.45)
+  ~conflict_radius float Warn when two drones close inside this (default 0.80)
+  ~coaltitude_band float Vertical band counted as same height   (default 0.50)
+  ~depot_jitter    float Unused since the warehouse change      (deprecated)
+  ~min_parcel_gap  float Keep pickup points this far apart, m   (default 0.30)
+  ~grounded_z      float Box centre below this counts as down  (default 0.12)
+  ~publish_hz      float Publish rate, Hz                      (default 10.0)
+"""
+
+import math
+import random
+import sys
+import threading
+
+import rospy
+
+# roslaunch captures a node's output through a pipe, and Python block-buffers
+# into a pipe rather than line-buffering as it would to a terminal. This node
+# logs only on events, so several minutes of assignments and deliveries can sit
+# unflushed and the run looks like it is not despatching anything at all.
+#
+# Both streams, and the second one is easy to miss: rospy sends INFO to stdout
+# but WARN and ERROR to *stderr*, and on Python 3.8 stderr into a pipe is
+# block-buffered too (it only became unconditionally line-buffered in 3.9).
+# Fixing stdout alone therefore fixes the ordinary log and silently keeps
+# exactly the lines worth reading - proximity, misdeliveries, rescues - in a
+# buffer. Measured: seven PROXIMITY warnings in the node's own log file and
+# none at all in the terminal.
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Pose, Point
+from std_msgs.msg import ColorRGBA
+from visualization_msgs.msg import Marker, MarkerArray
+from gazebo_msgs.msg import ModelState, ModelStates
+from gazebo_msgs.srv import SpawnModel, SpawnModelRequest
+from gazebo_msgs.srv import DeleteModel, DeleteModelRequest
+from gazebo_msgs.srv import SetModelState, GetWorldProperties
+
+from uav_delivery.msg import Parcel, ParcelArray
+
+
+# A box. Dynamic, unlike every other model these packages spawn, because it has
+# to be picked up and to fall if it is dropped. The link is called "link"
+# because gazebo_ros_link_attacher addresses things by model and link name and
+# the courier is told to expect that.
+_BOX_SDF = """\
+<?xml version="1.0"?>
+<sdf version="1.6">
+  <model name="parcel_box">
+    <link name="link">
+      <inertial>
+        <mass>%(mass).4f</mass>
+        <inertia><ixx>%(inertia).8f</ixx><ixy>0</ixy><ixz>0</ixz>
+                 <iyy>%(inertia).8f</iyy><iyz>0</iyz><izz>%(inertia).8f</izz></inertia>
+      </inertial>
+      <collision name="c">
+        <geometry><box><size>%(size).3f %(size).3f %(size).3f</size></box></geometry>
+        <surface>
+          <friction><ode><mu>1.0</mu><mu2>1.0</mu2></ode></friction>
+        </surface>
+      </collision>
+      <visual name="v">
+        <geometry><box><size>%(size).3f %(size).3f %(size).3f</size></box></geometry>
+        <material>
+          <ambient>%(r).2f %(g).2f %(b).2f 1</ambient>
+          <diffuse>%(r2).2f %(g2).2f %(b2).2f 1</diffuse>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>"""
+
+# A doorstep marker: a flat disc at the customer's address, in a washed-out
+# version of the parcel's own colour. Light on purpose - it marks a place that
+# is *waiting* for something, and a saturated pad competes with the box itself
+# for attention when the two are side by side at the moment of delivery.
+#
+# Visual only and static: it is a painted marking, and a lip is something a
+# descending box can catch on.
+_DOORSTEP_SDF = """\
+<?xml version="1.0"?>
+<sdf version="1.6">
+  <model name="doorstep">
+    <static>true</static>
+    <link name="link">
+      <visual name="pad">
+        <geometry><cylinder><radius>%(radius).3f</radius><length>0.004</length></cylinder></geometry>
+        <material>
+          <ambient>%(ar).3f %(ag).3f %(ab).3f 1</ambient>
+          <diffuse>%(r).3f %(g).3f %(b).3f 1</diffuse>
+          <emissive>%(er).3f %(eg).3f %(eb).3f 1</emissive>
+        </material>
+      </visual>
+      <visual name="ring">
+        <pose>0 0 0.001 0 0 0</pose>
+        <geometry><cylinder><radius>%(rim).3f</radius><length>0.002</length></cylinder></geometry>
+        <material>
+          <ambient>%(r).3f %(g).3f %(b).3f 1</ambient>
+          <diffuse>%(r).3f %(g).3f %(b).3f 1</diffuse>
+          <emissive>%(er).3f %(eg).3f %(eb).3f 1</emissive>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>"""
+
+
+def _lighten(rgb, amount=0.62):
+    """Wash a colour towards white, keeping its hue recognisable."""
+    return tuple(c + (1.0 - c) * amount for c in rgb)
+
+
+_COLOURS = [
+    (0.85, 0.20, 0.20),
+    (0.95, 0.60, 0.15),
+    (0.30, 0.80, 0.35),
+    (0.25, 0.55, 0.95),
+    (0.80, 0.35, 0.90),
+    (0.20, 0.80, 0.80),
+    (0.90, 0.85, 0.25),
+]
+
+
+class _Job(object):
+    """One customer, and the single order they placed.
+
+    Created once and never reused. When the order is delivered this whole
+    object goes, its two Gazebo models are deleted, and the next customer is a
+    new one with a new number - which is the point. Recycling a fixed pool and
+    teleporting the models around produces the same pixels and a quietly
+    different story: five immortal customers whose addresses keep moving,
+    rather than a stream of one-off orders.
+
+    Giving every customer a fresh model name also sidesteps the delete/spawn
+    race that this package documents elsewhere. Gazebo answers both calls
+    immediately and performs them on a later world update, so deleting a name
+    and re-spawning *the same name* can interleave; two different names cannot
+    collide no matter what order the world update applies them in.
+    """
+
+    def __init__(self, cust_id, size):
+        self.id = cust_id
+        self.box = 'order_%d' % cust_id
+        self.pad = 'doorstep_%d' % cust_id
+        self.size = size
+        self.src_name = ''
+        self.src_x = 0.0
+        self.src_y = 0.0
+        self.dst_name = ''
+        self.dst_x = 0.0
+        self.dst_y = 0.0
+        self.state = Parcel.WAITING
+        self.carrier = ''
+        self.released = False
+        self.spawned = False
+        self.pad_spawned = False
+        self.delivered_at = None      # when it landed, for the dwell
+        self.blank_at = None          # when the address was cleared
+
+    def to_msg(self):
+        p = Parcel()
+        p.id = self.id
+        p.box = self.box
+        p.src_name = self.src_name
+        p.src_x = self.src_x
+        p.src_y = self.src_y
+        p.dst_name = self.dst_name
+        p.dst_x = self.dst_x
+        p.dst_y = self.dst_y
+        p.state = self.state
+        p.carrier = self.carrier
+        return p
+
+
+class Dispatcher(object):
+
+    def __init__(self):
+        rospy.init_node('dispatcher', anonymous=False)
+
+        self._drones     = rospy.get_param('~drones', [])
+        self._n          = int(rospy.get_param('~num_parcels', 5))
+        self._box_size   = rospy.get_param('~box_size', 0.10)
+        self._box_mass   = rospy.get_param('~box_mass', 0.04)
+        self._deliver_r  = rospy.get_param('~deliver_radius', 0.45)
+        self._jitter     = rospy.get_param('~depot_jitter', 0.18)
+        self._conflict_r = rospy.get_param('~conflict_radius', 0.80)
+        self._coalt_dz   = rospy.get_param('~coaltitude_band', 0.50)
+        self._min_gap    = rospy.get_param('~min_parcel_gap', 0.30)
+        self._ground_z   = rospy.get_param('~grounded_z', 0.12)
+        pub_hz           = rospy.get_param('~publish_hz', 10.0)
+
+        wh = rospy.get_param('~warehouse', ['WH', 0.0, 0.0])
+        self._warehouse = (str(wh[0]), float(wh[1]), float(wh[2]))
+        self._apron = rospy.get_param('~apron_half', 1.8)
+        self._obstacles = rospy.get_param('~obstacles', [])
+        self._cust_half = rospy.get_param('~customer_half', 12.0)
+        self._cust_min_wh = rospy.get_param('~customer_min_from_warehouse', 9.0)
+        self._cust_gap = rospy.get_param('~customer_gap', 3.0)
+        self._grid = rospy.get_param('~grid_cell', 3.2)
+        self._dwell = rospy.get_param('~delivered_dwell', 3.0)
+        self._blank = rospy.get_param('~address_blank', 0.8)
+        self._yard_half = rospy.get_param('~yard_half', 16.0)
+        self._retrieve_clear = rospy.get_param('~retrieve_clearance', 1.6)
+
+        if not self._drones:
+            rospy.logwarn('[DISPATCH] ~drones is empty - nothing will be tasked')
+
+        # Every parcel now starts at one place, so the apron has to be big
+        # enough to lay them all out with ~min_parcel_gap between them. Packing
+        # n points at that spacing needs roughly n*gap^2 of area; well short of
+        # that and _new_addresses spends its whole sampling budget failing.
+        need = self._n * self._min_gap ** 2
+        have = (2.0 * self._apron) ** 2
+        if have < need:
+            rospy.logwarn('[DISPATCH] %d parcels at %.2f m spacing want about '
+                          '%.1f m2 of apron and ~apron_half=%.1f gives %.1f - '
+                          'boxes will end up closer together than asked',
+                          self._n, self._min_gap, need, self._apron, have)
+
+        self._pose = {}
+        self._have_pose = {}
+        self._score = {}
+        self._delivered = {}
+        self._task_pub = {}
+
+        for ns in self._drones:
+            self._pose[ns] = (0.0, 0.0, 0.0)
+            self._have_pose[ns] = False
+            self._score[ns] = 0
+            self._delivered[ns] = 0
+            self._task_pub[ns] = rospy.Publisher(
+                '/%s/delivery/task' % ns, Parcel, queue_size=10, latch=True)
+            rospy.Subscriber('/%s/ground_truth/state' % ns, Odometry,
+                             self._odom_cb, callback_args=ns)
+
+        self._box_pose = {}          # model name -> (x, y, z)
+        # Separation watch. The dispatcher is the only node that sees every
+        # aircraft, so it is the natural place to measure how close the fleet
+        # actually comes to itself - which is the number any deconfliction
+        # scheme has to be judged on.
+        self._closest = float('inf')
+        self._closest_pair = ''
+        self._closest_coalt = float('inf')
+        self._coalt_pair = ''
+        self._conflicts = 0
+        self._last_sep_report = rospy.Time(0)
+        self._model_lock = threading.Lock()
+
+        self._parcel_pub = rospy.Publisher(
+            '/delivery/parcels', ParcelArray, queue_size=5)
+        self._marker_pub = rospy.Publisher(
+            '/delivery/markers', MarkerArray, queue_size=5, latch=True)
+
+        rospy.loginfo('[DISPATCH] waiting for Gazebo model services...')
+        rospy.wait_for_service('/gazebo/spawn_sdf_model', timeout=60.0)
+        rospy.wait_for_service('/gazebo/delete_model', timeout=60.0)
+        rospy.wait_for_service('/gazebo/set_model_state', timeout=60.0)
+        rospy.wait_for_service('/gazebo/get_world_properties', timeout=60.0)
+        self._spawn_srv  = rospy.ServiceProxy('/gazebo/spawn_sdf_model', SpawnModel)
+        self._delete_srv = rospy.ServiceProxy('/gazebo/delete_model', DeleteModel)
+        self._move_srv   = rospy.ServiceProxy('/gazebo/set_model_state', SetModelState)
+        self._world_srv  = rospy.ServiceProxy('/gazebo/get_world_properties',
+                                              GetWorldProperties)
+
+        self._next_cust = 0
+        self._drawn_ids = set()
+        self._sweep_previous_run()
+        self._jobs = []
+        for _ in range(self._n):
+            self._jobs.append(self._new_customer())
+
+        rospy.Subscriber('/gazebo/model_states', ModelStates, self._models_cb,
+                         queue_size=1)
+        rospy.Subscriber('/delivery/report', Parcel, self._report_cb)
+
+        self._publish_markers()
+
+        rospy.loginfo('[DISPATCH] %s open | %d parcels | customers anywhere '
+                      'within %.0f m, at least %.0f m out | deliver within '
+                      '%.2f m | couriers: %s',
+                      self._warehouse[0], self._n, self._cust_half,
+                      self._cust_min_wh, self._deliver_r,
+                      ', '.join(self._drones) if self._drones else '(nobody)')
+        for job in self._jobs:
+            rospy.loginfo('[DISPATCH] parcel %d: %s -> %s', job.id,
+                          job.src_name, job.dst_name)
+
+        rospy.Timer(rospy.Duration(1.0 / pub_hz), self._tick)
+
+    # -------------------------------------------------------- Gazebo models --
+    def _model_in_world(self, name):
+        try:
+            return name in self._world_srv().model_names
+        except Exception:
+            return False
+
+    def _sweep_previous_run(self):
+        """Delete every order and doorstep left over from an earlier run.
+
+        Names are unique per customer now, so a leftover cannot collide with
+        anything this run creates - but it would sit in the world for ever
+        looking like an outstanding delivery, so it goes.
+        """
+        try:
+            names = list(self._world_srv().model_names)
+        except Exception:
+            return
+        for name in names:
+            if not (name.startswith('order_') or name.startswith('doorstep_')):
+                continue
+            req = DeleteModelRequest()
+            req.model_name = name
+            try:
+                self._delete_srv(req)
+            except Exception:
+                pass
+
+    def _new_customer(self):
+        """A brand-new customer: an address, an order, and the models for both."""
+        job = _Job(self._next_cust, self._box_size)
+        self._next_cust += 1
+        self._new_addresses(job)
+        self._spawn_box(job)
+        self._spawn_doorstep(job)
+        rospy.loginfo('[DISPATCH] new customer #%d at %s, order waiting at %s',
+                      job.id, job.dst_name, job.src_name)
+        return job
+
+    def _retire_customer(self, job):
+        """Remove a delivered customer from the world entirely.
+
+        Both models are deleted rather than parked somewhere: the customer has
+        had their delivery and no longer exists. Nothing is reused, so nothing
+        has to be tracked afterwards.
+        """
+        for name in (job.box, job.pad):
+            req = DeleteModelRequest()
+            req.model_name = name
+            try:
+                self._delete_srv(req)
+            except Exception as exc:
+                rospy.logwarn('[DISPATCH] could not delete %s: %s', name, exc)
+
+    def _clear_stale_model(self, job):
+        """Remove a box left behind by a previous run, if there is one.
+
+        Asked about first rather than deleted blind: Gazebo logs an ERROR for
+        the delete of a model that is not there, and a screenful of those at
+        every startup is indistinguishable at a glance from the ones that mean
+        something.
+        """
+        for name in (job.box, job.pad):
+            if not self._model_in_world(name):
+                continue
+            req = DeleteModelRequest()
+            req.model_name = name
+            try:
+                self._delete_srv(req)
+            except Exception:
+                pass
+
+    def _box_xml(self, job):
+        r, g, b = _COLOURS[job.id % len(_COLOURS)]
+        inertia = self._box_mass * (2.0 * self._box_size ** 2) / 12.0
+        return _BOX_SDF % {
+            'mass': self._box_mass, 'inertia': inertia, 'size': self._box_size,
+            'r': r * 0.4, 'g': g * 0.4, 'b': b * 0.4,
+            'r2': r, 'g2': g, 'b2': b,
+        }
+
+    def _spawn_box(self, job):
+        pose = Pose()
+        pose.position.x = job.src_x
+        pose.position.y = job.src_y
+        pose.position.z = self._box_size / 2.0
+        pose.orientation.w = 1.0
+
+        req = SpawnModelRequest()
+        req.model_name      = job.box
+        req.model_xml       = self._box_xml(job)
+        req.reference_frame = 'world'
+        req.initial_pose    = pose
+        try:
+            resp = self._spawn_srv(req)
+            if resp.success:
+                job.spawned = True
+            else:
+                rospy.logwarn('[DISPATCH] spawn of %s failed: %s',
+                              job.box, resp.status_message)
+        except Exception as exc:
+            rospy.logwarn('[DISPATCH] spawn service error: %s', exc)
+
+    def _doorstep_xml(self, job):
+        r, g, b = _lighten(_COLOURS[job.id % len(_COLOURS)])
+        return _DOORSTEP_SDF % {
+            'radius': self._deliver_r, 'rim': self._deliver_r * 1.12,
+            'r': r, 'g': g, 'b': b,
+            'ar': r * 0.75, 'ag': g * 0.75, 'ab': b * 0.75,
+            'er': r * 0.30, 'eg': g * 0.30, 'eb': b * 0.30,
+        }
+
+    def _spawn_doorstep(self, job):
+        pose = Pose()
+        pose.position.x = job.dst_x
+        pose.position.y = job.dst_y
+        pose.position.z = 0.002
+        pose.orientation.w = 1.0
+
+        req = SpawnModelRequest()
+        req.model_name      = job.pad
+        req.model_xml       = self._doorstep_xml(job)
+        req.reference_frame = 'world'
+        req.initial_pose    = pose
+        try:
+            resp = self._spawn_srv(req)
+            if resp.success:
+                job.pad_spawned = True
+            else:
+                rospy.logwarn('[DISPATCH] doorstep %d failed to spawn: %s',
+                              job.id, resp.status_message)
+        except Exception as exc:
+            rospy.logwarn('[DISPATCH] doorstep spawn error: %s', exc)
+
+    def _hide_doorstep(self, job):
+        """Put the marker out of sight, under the floor.
+
+        Moved rather than deleted, for the reason every model in this package
+        is moved rather than deleted: Gazebo answers delete immediately and
+        performs it on a later world update, so a delete/spawn pair races
+        itself and leaves a model the node believes is gone. Sinking it is
+        instant, reversible and cannot fail halfway.
+        """
+        if not job.pad_spawned:
+            return
+        state = ModelState()
+        state.model_name = job.pad
+        state.reference_frame = 'world'
+        state.pose.position.x = job.dst_x
+        state.pose.position.y = job.dst_y
+        state.pose.position.z = -3.0
+        state.pose.orientation.w = 1.0
+        try:
+            self._move_srv(state)
+        except Exception as exc:
+            rospy.logwarn('[DISPATCH] doorstep hide error: %s', exc)
+
+    def _move_doorstep(self, job):
+        """Put the marker on the new address. Moved, never respawned.
+
+        Same reasoning as the boxes: Gazebo answers spawn and delete
+        immediately but defers both to a world update, so delete-then-spawn
+        races itself and leaves a model the node believes is gone.
+        """
+        if not job.pad_spawned:
+            self._spawn_doorstep(job)
+            return
+        state = ModelState()
+        state.model_name = job.pad
+        state.reference_frame = 'world'
+        state.pose.position.x = job.dst_x
+        state.pose.position.y = job.dst_y
+        state.pose.position.z = 0.002
+        state.pose.orientation.w = 1.0
+        try:
+            if not self._move_srv(state).success:
+                self._spawn_doorstep(job)
+        except Exception as exc:
+            rospy.logwarn('[DISPATCH] doorstep move error: %s', exc)
+
+    def _move_box(self, job):
+        """Teleport a box to its (new) source, stopped and square.
+
+        The twist in ModelState defaults to zero and set_model_state applies
+        it, which matters here in a way it did not for the static models the
+        sibling packages move: a box that has just been dropped is a dynamic
+        body with velocity, and teleporting it without clearing that would
+        launch it off its new depot.
+        """
+        state = ModelState()
+        state.model_name = job.box
+        state.reference_frame = 'world'
+        state.pose.position.x = job.src_x
+        state.pose.position.y = job.src_y
+        state.pose.position.z = self._box_size / 2.0
+        state.pose.orientation.w = 1.0
+        try:
+            return self._move_srv(state).success
+        except Exception as exc:
+            rospy.logwarn('[DISPATCH] move service error: %s', exc)
+            return False
+
+    def _reposition(self, job):
+        with self._model_lock:
+            self._move_doorstep(job)
+            if job.spawned and self._move_box(job):
+                return
+            self._spawn_box(job)
+
+    # ------------------------------------------------------------ addresses --
+    def _source_clear(self, x, y, job):
+        """Is (x, y) far enough from every other parcel\'s pickup point?"""
+        for other in self._jobs:
+            if other is job:
+                continue
+            if math.hypot(x - other.src_x, y - other.src_y) < self._min_gap:
+                return False
+        return True
+
+    def _grid_ref(self, x, y):
+        """Name a point by the grid square it falls in, e.g. "F7".
+
+        Derived from the position rather than stored beside it, so an address
+        and the place it refers to cannot drift apart - which they can and do
+        the moment a list of names and a list of coordinates are maintained
+        separately.
+        """
+        col = int((x + self._yard_half) / self._grid)
+        row = int((y + self._yard_half) / self._grid)
+        span = max(1, int((2.0 * self._yard_half) / self._grid))
+        col = max(0, min(col, span - 1))
+        row = max(0, min(row, span - 1))
+        return "%s%d" % (chr(ord('A') + col), row + 1)
+
+    def _customer_ok(self, x, y, job):
+        """Is this a place a parcel could sensibly be delivered to?
+
+        Three things disqualify a point, and each is a real failure that was
+        cheaper to design out than to handle:
+
+          * too near an obstacle - a courier cannot descend onto a doorstep
+            that is inside its own laser's stop distance without the safety
+            filter backing it off at 0.8 m and tipping it over;
+          * too near the warehouse - the delivery would be over before the
+            aircraft had finished climbing, which is a score with no flying
+            in it;
+          * too near another outstanding address - two doorsteps closer than
+            the descent guard's radius mean the second courier queues behind
+            the first for no reason.
+        """
+        if not self._retrievable(x, y):
+            return False
+        if math.hypot(x - self._warehouse[1],
+                      y - self._warehouse[2]) < self._cust_min_wh:
+            return False
+        for other in self._jobs:
+            if other is job or other.state == Parcel.DELIVERED:
+                continue
+            if math.hypot(x - other.dst_x, y - other.dst_y) < self._cust_gap:
+                return False
+        return True
+
+    def _draw_customer(self, job):
+        """A fresh address, somewhere in the yard.
+
+        Rejection sampling with a cap, and the cap matters: a badly set
+        customer_half against a large customer_min_from_warehouse can describe
+        an empty region, and the honest failure is a warning and a slightly
+        awkward address rather than a node that never finishes starting.
+        """
+        for _ in range(400):
+            x = random.uniform(-self._cust_half, self._cust_half)
+            y = random.uniform(-self._cust_half, self._cust_half)
+            if self._customer_ok(x, y, job):
+                return x, y
+        rospy.logwarn('[DISPATCH] no clear address for parcel %d in 400 tries '
+                      '- check ~customer_half against '
+                      '~customer_min_from_warehouse and ~obstacles', job.id)
+        ang = random.uniform(0.0, 2.0 * math.pi)
+        r = self._cust_min_wh + 1.0
+        return (self._warehouse[1] + r * math.cos(ang),
+                self._warehouse[2] + r * math.sin(ang))
+
+    def _new_addresses(self, job):
+        """Put a box on the warehouse apron and give it a customer address.
+
+        Hub and spoke: every parcel starts at the one warehouse and goes to a
+        customer, which is what a delivery operation actually looks like and is
+        a different problem from the point-to-point version this replaced.
+        Sources no longer need choosing at all; what needs choosing is a spot on
+        the apron, and that is now the hard half.
+
+        Laying the boxes out
+        ~~~~~~~~~~~~~~~~~~~~
+        They must not share a point. Two dynamic bodies spawned on top of each
+        other are two bodies Gazebo\'s contact solver flings apart at speed -
+        seen when five parcels once drew the same depot in the old scheme: the
+        boxes scattered across the yard, every courier chased a target that was
+        still moving, and the run produced no pickups at all. With one shared
+        source that is no longer a rare draw, it is every single run, so the
+        spacing is sampled properly rather than jittered and hoped over.
+
+        The gap wants to be wider than "not touching", too. A courier will not
+        descend while another aircraft is within depot_guard_xy of its goal, so
+        boxes closer together than that turn the apron into a queue: one drone
+        loads while the others hold. Spread them further and two can work
+        different bays at once, which is the whole reason a real warehouse has
+        more than one loading door.
+
+        Choosing the address
+        ~~~~~~~~~~~~~~~~~~~~
+        Destinations are drawn from the addresses no other outstanding parcel is
+        going to, when one is free. Two parcels to one address is perfectly
+        realistic and is allowed when the board is busy - it just means the
+        second courier queues behind the first, which the descent guard already
+        handles.
+        """
+        name, wx, wy = self._warehouse
+
+        x, y = wx, wy
+        best = -1.0
+        for _ in range(200):
+            cx = wx + random.uniform(-self._apron, self._apron)
+            cy = wy + random.uniform(-self._apron, self._apron)
+            if self._source_clear(cx, cy, job):
+                x, y = cx, cy
+                break
+            # Keep the roomiest candidate rather than whichever came last. It
+            # only matters when the apron is too small for the parcel count and
+            # no spot can satisfy the gap at all - which is exactly the case
+            # where taking the last sample can put two boxes millimetres apart.
+            room = min([math.hypot(cx - o.src_x, cy - o.src_y)
+                        for o in self._jobs if o is not job] or [1e9])
+            if room > best:
+                best, x, y = room, cx, cy
+
+        dx, dy = self._draw_customer(job)
+
+        job.src_name, job.src_x, job.src_y = name, x, y
+        job.dst_name = self._grid_ref(dx, dy)
+        job.dst_x, job.dst_y = dx, dy
+        job.state = Parcel.WAITING
+        job.carrier = ''
+        job.released = False
+
+    # -------------------------------------------------------------- markers --
+    def _publish_markers(self):
+        """Depot labels and a line from each parcel to where it has to go.
+
+        World frame, so one RViz shows every drone and every parcel without a
+        transform between the namespaces.
+        """
+        arr = MarkerArray()
+        now = rospy.Time.now()
+
+        # Retired customers must be explicitly deleted. Marker ids are the
+        # customer numbers and those now climb for ever, so a marker that is
+        # simply stopped being republished stays on screen indefinitely - RViz
+        # holds the last one it was given. Anything drawn last tick and absent
+        # this one gets a DELETE.
+        live = set(j.id for j in self._jobs)
+        for gone in self._drawn_ids - live:
+            for ns in ('doorstep', 'address', 'route'):
+                d = Marker()
+                d.header.frame_id = 'world'
+                d.header.stamp = now
+                d.ns = ns
+                d.id = gone
+                d.action = Marker.DELETE
+                arr.markers.append(d)
+        self._drawn_ids = live
+
+        # The warehouse. The one fixed place left on the board.
+        wtxt = Marker()
+        wtxt.header.frame_id = 'world'
+        wtxt.header.stamp = now
+        wtxt.ns = 'warehouse'
+        wtxt.id = 0
+        wtxt.type = Marker.TEXT_VIEW_FACING
+        wtxt.action = Marker.ADD
+        wtxt.pose.position = Point(self._warehouse[1], self._warehouse[2], 1.2)
+        wtxt.pose.orientation.w = 1.0
+        wtxt.scale.z = 0.7
+        wtxt.color = ColorRGBA(1.0, 0.85, 0.2, 0.95)
+        wtxt.text = self._warehouse[0]
+        wtxt.lifetime = rospy.Duration(0)
+        arr.markers.append(wtxt)
+
+        # A doorstep for each outstanding parcel, at its randomly drawn
+        # address, in that parcel's colour. There are no fixed pads to label
+        # any more - the address is wherever this particular parcel is going,
+        # and it moves every time the parcel is re-issued.
+        for job in self._jobs:
+            r, g, b = _COLOURS[job.id % len(_COLOURS)]
+            pad = Marker()
+            pad.header.frame_id = 'world'
+            pad.header.stamp = now
+            pad.ns = 'doorstep'
+            pad.id = job.id
+            pad.type = Marker.CYLINDER
+            # Up while the parcel is outstanding, and while it is sitting
+            # delivered on the doorstep for its dwell - deleting it the instant
+            # it lands is the blink the dwell exists to prevent. Down during
+            # the blank between one order clearing and the next, so RViz and
+            # Gazebo agree that this customer has nothing outstanding.
+            pad.action = (Marker.DELETE if job.blank_at is not None
+                          else Marker.ADD)
+            pad.pose.position = Point(job.dst_x, job.dst_y, 0.02)
+            pad.pose.orientation.w = 1.0
+            pad.scale.x = pad.scale.y = 2.0 * self._deliver_r
+            pad.scale.z = 0.04
+            lr, lg, lb = _lighten((r, g, b))
+            pad.color = (ColorRGBA(0.25, 0.95, 0.35, 0.80)
+                         if job.state == Parcel.DELIVERED
+                         else ColorRGBA(lr, lg, lb, 0.55))
+            pad.lifetime = rospy.Duration(0)
+            arr.markers.append(pad)
+
+            atxt = Marker()
+            atxt.header.frame_id = 'world'
+            atxt.header.stamp = now
+            atxt.ns = 'address'
+            atxt.id = job.id
+            atxt.type = Marker.TEXT_VIEW_FACING
+            atxt.action = pad.action
+            atxt.text = job.dst_name
+            atxt.pose.position = Point(job.dst_x, job.dst_y, 0.9)
+            atxt.pose.orientation.w = 1.0
+            atxt.scale.z = 0.5
+            atxt.color = ColorRGBA(1.0, 1.0, 1.0, 0.9)
+            atxt.text = job.dst_name
+            atxt.lifetime = rospy.Duration(0)
+            arr.markers.append(atxt)
+
+        for job in self._jobs:
+            # The route. Drawn from the box's source to its destination, so
+            # the picture answers "where is this going" rather than only
+            # "where is it".
+            line = Marker()
+            line.header.frame_id = 'world'
+            line.header.stamp = now
+            line.ns = 'route'
+            line.id = job.id
+            line.type = Marker.LINE_LIST
+            line.action = (Marker.ADD if job.state != Parcel.DELIVERED
+                           else Marker.DELETE)
+            line.pose.orientation.w = 1.0
+            line.scale.x = 0.03
+            r, g, b = _COLOURS[job.id % len(_COLOURS)]
+            line.color = ColorRGBA(r, g, b, 0.55)
+            line.points = [Point(job.src_x, job.src_y, 0.06),
+                           Point(job.dst_x, job.dst_y, 0.06)]
+            line.lifetime = rospy.Duration(0)
+            arr.markers.append(line)
+
+            txt = Marker()
+            txt.header.frame_id = 'world'
+            txt.header.stamp = now
+            txt.ns = 'parcel_label'
+            txt.id = job.id
+            txt.type = Marker.TEXT_VIEW_FACING
+            txt.action = (Marker.ADD if job.state != Parcel.DELIVERED
+                          else Marker.DELETE)
+            txt.pose.position = Point(job.dst_x, job.dst_y, 0.9 + 0.22 * job.id)
+            txt.pose.orientation.w = 1.0
+            txt.scale.z = 0.22
+            txt.color = ColorRGBA(r, g, b, 1.0)
+            txt.text = '#%d %s>%s' % (job.id, job.src_name, job.dst_name)
+            txt.lifetime = rospy.Duration(0)
+            arr.markers.append(txt)
+
+        self._marker_pub.publish(arr)
+
+    # ------------------------------------------------------------ callbacks --
+    def _odom_cb(self, msg, ns):
+        p = msg.pose.pose.position
+        self._pose[ns] = (p.x, p.y, p.z)
+        self._have_pose[ns] = True
+
+    def _models_cb(self, msg):
+        """Where every box actually is. The authority on delivery.
+
+        The `order_` prefix is a contract between this filter and _Job.box.
+        Renaming one without the other silently empties this dict, and every
+        delivery then waits for a box position that never arrives. Cost when
+        it happened: a whole run with zero deliveries and not one error
+        anywhere, because nothing failed - it simply never confirmed.
+        """
+        for name, pose in zip(msg.name, msg.pose):
+            if name.startswith('order_'):
+                self._box_pose[name] = (pose.position.x, pose.position.y,
+                                        pose.position.z)
+
+    def _report_cb(self, msg):
+        """A courier telling us what it has done.
+
+        Only two of these matter. CARRIED is taken on trust, because the weld
+        either happened or it did not and the courier is the only thing that
+        knows; whether the box is really attached shows up a moment later
+        either way. DELIVERED is *not* taken on trust - it is only a nudge to
+        go and look at where the box is, which _tick does.
+        """
+        job = self._job_by_id(msg.id)
+        if job is None or job.carrier != msg.carrier:
+            return
+
+        if msg.state == Parcel.CARRIED and job.state == Parcel.CLAIMED:
+            job.state = Parcel.CARRIED
+            job.released = False
+            rospy.loginfo('[DISPATCH] %s has parcel %d (%s -> %s)',
+                          job.carrier, job.id, job.src_name, job.dst_name)
+
+        elif msg.state == Parcel.DELIVERED and job.state == Parcel.CARRIED:
+            # Not a delivery yet - only permission to go and look. _tick reads
+            # where the box actually is and decides.
+            job.released = True
+
+        elif msg.state == Parcel.WAITING:
+            # The courier has given up - timed out on an approach, or been
+            # respawned holding nothing. Put the parcel back on the board at
+            # wherever its box currently is; somebody else can have it.
+            rospy.logwarn('[DISPATCH] %s abandoned parcel %d', msg.carrier, job.id)
+            self._release_to_board(job)
+
+    # --------------------------------------------------------------- helpers -
+    def _job_by_id(self, job_id):
+        for job in self._jobs:
+            if job.id == job_id:
+                return job
+        return None
+
+    def _retrievable(self, x, y):
+        """Can a courier actually get down to a box lying here?
+
+        A dropped parcel comes to rest wherever physics puts it, and that is
+        not always somewhere an aircraft can follow. A box against a crate is
+        inside the laser's stop distance, so a courier descending onto it has
+        the safety filter backing it off and yawing at 0.8 m altitude, and it
+        tips over. Measured: a box dropped 0.67 m from the south-west stack
+        cost three rescues in ninety seconds, the same drone each time,
+        respawning and going straight back for it.
+
+        The warehouse layout makes this far more likely than the old one did.
+        Drops happen where the flying is busiest, which is now the hub in the
+        middle, and the crates ring that hub at radius 3.1.
+        """
+        for obs in self._obstacles:
+            ox, oy, radius = obs[0], obs[1], obs[2]
+            if math.hypot(x - ox, y - oy) < radius + self._retrieve_clear:
+                return False
+        return True
+
+    def _release_to_board(self, job):
+        """Return a parcel to WAITING, sourced from wherever its box is now.
+
+        Unless it has come to rest somewhere no courier can safely collect it,
+        in which case it is recovered to the warehouse instead. That is the
+        honest answer to an unreachable parcel: a real operation sends someone
+        to pick it up by hand rather than flying at it until something breaks.
+        Leaving it on the board where it fell is an invitation to a rescue
+        loop, because assignment is nearest-first and the aircraft that just
+        dropped it is invariably the nearest.
+        """
+        pos = self._box_pose.get(job.box)
+        if pos is not None and not self._retrievable(pos[0], pos[1]):
+            rospy.logwarn('[DISPATCH] parcel %d is down at (%.2f, %.2f), too '
+                          'close to an obstacle to collect - recovering it to '
+                          '%s', job.id, pos[0], pos[1], self._warehouse[0])
+            self._reissue_source(job)
+        elif pos is not None:
+            job.src_x, job.src_y = pos[0], pos[1]
+            job.src_name = self._nearest_depot_name(pos[0], pos[1])
+        job.state = Parcel.WAITING
+        job.carrier = ''
+
+    def _reissue_source(self, job):
+        """Put the box back on the apron, keeping its customer address.
+
+        The delivery still has to happen - only the pickup point moves.
+        """
+        name, wx, wy = self._warehouse
+        x, y = wx, wy
+        for _ in range(200):
+            cx = wx + random.uniform(-self._apron, self._apron)
+            cy = wy + random.uniform(-self._apron, self._apron)
+            if self._source_clear(cx, cy, job):
+                x, y = cx, cy
+                break
+        job.src_name, job.src_x, job.src_y = name, x, y
+        threading.Thread(target=self._reposition, args=(job,), daemon=True).start()
+        job.released = False
+
+    def _nearest_depot_name(self, x, y):
+        """What to call the place a box has come to rest.
+
+        The warehouse is in this list as well as the customer addresses, and
+        leaving it out was a real mistake rather than a cosmetic one: a parcel
+        dropped on the apron is *at the warehouse*, and calling it 'open
+        ground' - which is what happened, because the apron is 4.5 m from every
+        customer pad - reads in the log as a box lost somewhere in the yard.
+        The tolerance is per-place, too, since the apron is a 3.6 m square and
+        a customer pad is half a metre.
+        """
+        places = [(self._warehouse[0], self._warehouse[1], self._warehouse[2],
+                   self._apron + 0.4)]
+        for name, px, py, reach in places:
+            if math.hypot(x - px, y - py) <= reach:
+                return name
+        # Anywhere else is named by its grid square, which is what an address
+        # is here - there are no fixed pads left to be near.
+        return self._grid_ref(x, y)
+
+    def _busy(self):
+        return set(j.carrier for j in self._jobs
+                   if j.carrier and j.state in (Parcel.CLAIMED, Parcel.CARRIED))
+
+    # -------------------------------------------------------------- tasking --
+    def _assign(self):
+        """Give each idle drone a waiting parcel, nearest pickup first.
+
+        Greedy: score every (idle drone, waiting parcel) pair by how far the
+        drone is from the pickup, take the shortest, drop both, repeat. Not
+        optimal, but it never hands the same parcel to two aircraft, which is
+        the property the scenario actually requires.
+        """
+        busy = self._busy()
+        idle = [ns for ns in self._drones
+                if ns not in busy and self._have_pose[ns]]
+        waiting = [j for j in self._jobs if j.state == Parcel.WAITING]
+        if not idle or not waiting:
+            return
+
+        pairs = []
+        for ns in idle:
+            dx, dy, _ = self._pose[ns]
+            for job in waiting:
+                pairs.append((math.hypot(job.src_x - dx, job.src_y - dy),
+                              ns, job.id))
+        pairs.sort(key=lambda p: p[0])
+
+        taken_drones = set()
+        taken_jobs = set()
+        for dist, ns, job_id in pairs:
+            if ns in taken_drones or job_id in taken_jobs:
+                continue
+            job = self._job_by_id(job_id)
+            job.state = Parcel.CLAIMED
+            job.carrier = ns
+            taken_drones.add(ns)
+            taken_jobs.add(job_id)
+            rospy.loginfo('[DISPATCH] parcel %d (%s -> %s) assigned to %s, '
+                          '%.1f m from pickup',
+                          job.id, job.src_name, job.dst_name, ns, dist)
+
+    def _check_deliveries(self):
+        """Has any released box come to rest where it was supposed to?
+
+        Gated on the courier having reported a release, and that gate is not
+        optional. The obvious version - "a carried box that is on the ground
+        has been put down" - is true of a box the instant it is welded on,
+        because the aircraft grasps it where it lies and has not climbed yet.
+        Ungated, every pickup was read as a misdelivery two milliseconds after
+        the grasp: the parcel went back on the board while the drone was still
+        holding it, was immediately reassigned to that same drone as a fresh
+        pickup, and the two halves of the system spent the run disagreeing
+        about what the aircraft had in its gripper.
+        """
+        changed = False
+        for job in self._jobs:
+            if job.state != Parcel.CARRIED or not job.released:
+                continue
+            pos = self._box_pose.get(job.box)
+            if pos is None:
+                continue
+            x, y, z = pos
+            if z > self._ground_z:
+                continue          # still in the air, so still in transit
+
+            # On the ground. Either it is where it belongs, or the courier put
+            # it somewhere else and the parcel goes back on the board.
+            if math.hypot(x - job.dst_x, y - job.dst_y) <= self._deliver_r:
+                ns = job.carrier
+                if ns in self._score:
+                    self._score[ns] += 1
+                    self._delivered[ns] += 1
+                rospy.loginfo(
+                    '[DISPATCH] DELIVERED parcel %d %s -> %s by %s '
+                    '(%.2f m from the mark) | %s has %d',
+                    job.id, job.src_name, job.dst_name, ns,
+                    math.hypot(x - job.dst_x, y - job.dst_y), ns,
+                    self._delivered.get(ns, 0))
+                # Confirm to the courier before this customer is retired. It
+                # is holding the job open waiting to hear, and the object it
+                # refers to is about to be deleted.
+                job.state = Parcel.DELIVERED
+                self._task_pub[ns].publish(job.to_msg())
+                job.carrier = ''
+                # Left on the doorstep for a moment rather than cleared the
+                # instant it is confirmed. Re-issuing immediately teleports the
+                # box back to the warehouse while the courier that delivered it
+                # is still climbing off the address, so the delivery is never
+                # actually visible - the parcel simply blinks out mid-frame.
+                # The dwell is the only part of a job a person watching can
+                # see the result of.
+                job.delivered_at = rospy.Time.now()
+                changed = True
+            else:
+                rospy.logwarn(
+                    '[DISPATCH] parcel %d put down at (%.2f, %.2f), %.2f m '
+                    'from %s - back on the board',
+                    job.id, x, y,
+                    math.hypot(x - job.dst_x, y - job.dst_y), job.dst_name)
+                self._release_to_board(job)
+                changed = True
+        return changed
+
+    def _clear_delivered(self):
+        """Sweep away parcels whose dwell on the doorstep has run out.
+
+        The box goes back to the warehouse as a fresh order and the doorstep
+        marker moves to whatever address that new order drew, so both vanish
+        from the customer together - which is what a completed delivery should
+        look like.
+        """
+        changed = False
+        now = rospy.Time.now()
+
+        for i, job in enumerate(self._jobs):
+            # Stage one: the dwell is up. This customer has had their delivery,
+            # so the order and the address are both deleted and the customer
+            # ceases to exist. For a moment that slot in the round is empty,
+            # which is what makes the next one read as a *new* customer rather
+            # than the same marker sliding across the yard.
+            if (job.state == Parcel.DELIVERED and job.delivered_at is not None
+                    and (now - job.delivered_at).to_sec() >= self._dwell):
+                job.delivered_at = None
+                job.blank_at = now
+                threading.Thread(target=self._retire_customer,
+                                 args=(job,), daemon=True).start()
+                rospy.loginfo('[DISPATCH] customer #%d at %s served - order '
+                              'and address removed', job.id, job.dst_name)
+                changed = True
+                continue
+
+            # Stage two: somebody new places an order.
+            if (job.state == Parcel.DELIVERED and job.blank_at is not None
+                    and (now - job.blank_at).to_sec() >= self._blank):
+                self._jobs[i] = self._new_customer()
+                changed = True
+        return changed
+
+    def _return_to_warehouse(self, job):
+        """Put an existing order back on the apron.
+
+        Only for parcels that were dropped somewhere unreachable - a delivered
+        customer is retired outright rather than recycled.
+        """
+        name, wx, wy = self._warehouse
+        x, y = wx, wy
+        for _ in range(200):
+            cx = wx + random.uniform(-self._apron, self._apron)
+            cy = wy + random.uniform(-self._apron, self._apron)
+            if self._source_clear(cx, cy, job):
+                x, y = cx, cy
+                break
+        job.src_name, job.src_x, job.src_y = name, x, y
+        threading.Thread(target=self._reposition_box_only,
+                         args=(job,), daemon=True).start()
+
+    def _reposition_box_only(self, job):
+        with self._model_lock:
+            if job.spawned and self._move_box(job):
+                return
+            self._spawn_box(job)
+
+    def _show_doorstep(self, job):
+        with self._model_lock:
+            self._move_doorstep(job)
+
+    def _watch_separation(self):
+        """Log how close the fleet gets to itself.
+
+        Passive: it changes nothing and steers nobody. It exists so that
+        "the drones avoid each other" is a measured claim rather than an
+        assumed one.
+        """
+        ready = [ns for ns in self._drones if self._have_pose[ns]]
+        for i, a in enumerate(ready):
+            ax, ay, az = self._pose[a]
+            for b in ready[i + 1:]:
+                bx, by, bz = self._pose[b]
+                d = math.sqrt((ax - bx) ** 2 + (ay - by) ** 2 + (az - bz) ** 2)
+                if d < self._closest:
+                    self._closest = d
+                    self._closest_pair = '%s/%s' % (a, b)
+
+                # The number that actually means danger. A plain 3D minimum
+                # cannot tell "two aircraft stacked a layer apart, entirely
+                # safe" from "two aircraft about to touch", because with a
+                # 0.7 m layer gap the first reads 0.70 m. Rotor span is 0.8 m,
+                # so what matters is how close two aircraft get *horizontally*
+                # while they are at much the same height.
+                if abs(az - bz) <= self._coalt_dz:
+                    h = math.hypot(ax - bx, ay - by)
+                    if h < self._closest_coalt:
+                        self._closest_coalt = h
+                        self._coalt_pair = '%s/%s' % (a, b)
+                if abs(az - bz) <= self._coalt_dz and \
+                        math.hypot(ax - bx, ay - by) < self._conflict_r:
+                    self._conflicts += 1
+                    rospy.logwarn_throttle(
+                        3.0, '[DISPATCH] PROXIMITY %s and %s %.2f m apart '
+                        'horizontally at the same height (co-altitude closest '
+                        'so far %.2f m, %s)',
+                        a, b, math.hypot(ax - bx, ay - by),
+                        self._closest_coalt, self._coalt_pair)
+
+        # Report the running minimum on a timer as well as on conflict. A quiet
+        # run is the interesting case for a deconfliction change, and it is
+        # exactly the one that produces no conflict lines at all - so without
+        # this there is no number left behind to compare against.
+        now = rospy.Time.now()
+        if (now - self._last_sep_report).to_sec() >= 30.0 and self._closest < 1e9:
+            self._last_sep_report = now
+            rospy.loginfo('[DISPATCH] SEPARATION co-altitude closest %.2f m '
+                          '(%s) | 3D closest %.2f m (%s) | %d conflict ticks',
+                          self._closest_coalt, self._coalt_pair or '-',
+                          self._closest, self._closest_pair or '-',
+                          self._conflicts)
+
+    def _tick(self, _event):
+        self._watch_separation()
+        changed = self._check_deliveries()
+        changed = self._clear_delivered() or changed
+        self._assign()
+
+        for job in self._jobs:
+            if job.carrier:
+                self._task_pub[job.carrier].publish(job.to_msg())
+
+        if changed:
+            self._publish_markers()
+
+        arr = ParcelArray()
+        arr.header.stamp = rospy.Time.now()
+        arr.header.frame_id = 'world'
+        arr.parcels = [j.to_msg() for j in self._jobs]
+        self._parcel_pub.publish(arr)
+
+
+def main():
+    Dispatcher()
+    rospy.spin()
+
+
+if __name__ == '__main__':
+    main()

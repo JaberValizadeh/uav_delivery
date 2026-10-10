@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""
+clearance_monitor - measures how close the couriers actually get to the city.
+
+"The drones avoid obstacles" is not a claim anything in this package could
+previously check. The couriers avoid reactively off a 2D laser, so the evidence
+for the avoidance working was that nobody watched one hit a building - which is
+the same evidence you get from not watching at all.
+
+This node measures it. It reads the exact collision geometry from
+config/city_geometry.yaml, tracks every aircraft's pose, and reports the
+smallest gap each one ever left between itself and a solid object.
+
+Measuring the right distance
+----------------------------
+Not centre-to-centre, and not against the conservative circles in
+city_obstacles.yaml. Those circles circumscribe each building, so a drone
+passing a corner diagonally looks closer than it is and a perfectly safe flight
+scores as a near miss. This measures to the true surface:
+
+  buildings   distance from the aircraft to the nearest point of the rectangle,
+              which for a point outside a box is hypot(max(|dx|-hx, 0),
+              max(|dy|-hy, 0))
+  trees       distance to the trunk axis, less the trunk radius
+
+and only while the aircraft is within the object's height band, because a drone
+at 2.6 m is not in contact with a 12 m tower it is 8 m to the side of, and is
+also not in contact with anything at all when it is above one.
+
+What counts as a crash
+----------------------
+The airframe is about 0.35 m from centre to rotor tip, so a gap below that means
+rotor and wall occupy the same space. Between there and ~0.55 m is close enough
+that a gust or an overshoot would have hit. Both are counted, separately,
+because the first is a failure and the second is a warning that the margins are
+thin.
+
+Reports on shutdown, and every ~15 s while running so a bad run can be stopped
+early instead of watched to the end.
+
+Subscriptions
+-------------
+  <ns>/ground_truth/state    nav_msgs/Odometry, one per aircraft
+
+ROS Parameters (private, ~)
+---------------------------
+  ~geometry_file  str   the generated city_geometry.yaml
+  ~namespaces     list  aircraft to watch (default [uav_0, uav_1, uav_2])
+  ~rotor_radius   float contact below this, m            (default 0.35)
+  ~near_miss      float warn below this, m               (default 0.55)
+  ~report_period  float seconds between interim reports  (default 15.0)
+"""
+
+import math
+
+import rospy
+import yaml
+from nav_msgs.msg import Odometry
+
+
+BOLD = '\033[1m'
+GREEN = '\033[92m'
+RED = '\033[91m'
+AMBER = '\033[93m'
+CYAN = '\033[96m'
+OFF = '\033[0m'
+
+
+def say(text=''):
+    # Flushed, because a scored run is one whose output is redirected to a file.
+    print(text, flush=True)
+
+
+class Track(object):
+    def __init__(self, ns):
+        self.ns = ns
+        self.min_gap = float('inf')
+        self.min_at = None
+        self.min_obj = None
+        self.contacts = 0
+        self.near_misses = 0
+        self.samples = 0
+        self._breached = False        # one event, not one per sample
+
+
+class ClearanceMonitor(object):
+
+    def __init__(self):
+        rospy.init_node('clearance_monitor')
+
+        path = rospy.get_param('~geometry_file', '')
+        self._rotor = rospy.get_param('~rotor_radius', 0.35)
+        self._near = rospy.get_param('~near_miss', 0.55)
+        period = rospy.get_param('~report_period', 15.0)
+        names = rospy.get_param('~namespaces', ['uav_0', 'uav_1', 'uav_2'])
+
+        self._solids = []
+        try:
+            with open(path) as fh:
+                for s in (yaml.safe_load(fh) or {}).get('solids', []):
+                    kind, x, y, a, b, z0, z1 = s
+                    self._solids.append((kind, float(x), float(y), float(a),
+                                         float(b), float(z0), float(z1)))
+        except (IOError, ValueError, TypeError) as exc:
+            rospy.logerr('[CLEAR] cannot read %s: %s - nothing to measure '
+                         'against, so this node has no opinion', path, exc)
+
+        self._tracks = {}
+        for ns in names:
+            self._tracks[ns] = Track(ns)
+            rospy.Subscriber('/%s/ground_truth/state' % ns, Odometry,
+                             self._odom_cb, callback_args=ns, queue_size=1)
+
+        rospy.Timer(rospy.Duration(period), self._interim)
+        rospy.on_shutdown(self._final)
+        rospy.loginfo('[CLEAR] watching %d aircraft against %d solids',
+                      len(names), len(self._solids))
+
+    # --------------------------------------------------------------- geometry --
+    def _gap(self, x, y, z):
+        """Smallest distance from this point to any solid's surface, in plan.
+
+        Objects whose height band the aircraft is not inside are skipped: a
+        drone at 2.6 m cannot be in contact with a 2.4 m tree trunk's canopy
+        band it is flying over, and clearance to something underneath it is not
+        clearance at all.
+        """
+        best = float('inf')
+        which = None
+        for kind, ox, oy, a, b, z0, z1 in self._solids:
+            if z < z0 or z > z1:
+                continue
+            if kind == 'box':
+                dx = max(abs(x - ox) - a, 0.0)
+                dy = max(abs(y - oy) - b, 0.0)
+                d = math.hypot(dx, dy)
+            else:
+                d = max(math.hypot(x - ox, y - oy) - a, 0.0)
+            if d < best:
+                best, which = d, (kind, ox, oy)
+        return best, which
+
+    def _odom_cb(self, msg, ns):
+        t = self._tracks[ns]
+        p = msg.pose.pose.position
+        gap, which = self._gap(p.x, p.y, p.z)
+        if gap == float('inf'):
+            return
+        t.samples += 1
+        if gap < t.min_gap:
+            t.min_gap = gap
+            t.min_at = (p.x, p.y, p.z)
+            t.min_obj = which
+
+        # Edge-triggered: a drone parked 0.3 m from a wall is one contact, not
+        # two hundred. Counting samples would make a slow approach look far
+        # worse than a fast one, which is backwards.
+        if gap < self._rotor:
+            if not t._breached:
+                t.contacts += 1
+                t._breached = True
+                rospy.logwarn('[CLEAR] %s CONTACT: %.2f m at (%.1f, %.1f, %.1f)',
+                              ns, gap, p.x, p.y, p.z)
+        elif gap < self._near:
+            if not t._breached:
+                t.near_misses += 1
+                t._breached = True
+        elif gap > self._near + 0.15:
+            t._breached = False       # hysteresis, so jitter is not two events
+
+    # ---------------------------------------------------------------- output --
+    def _interim(self, _):
+        bits = []
+        for ns in sorted(self._tracks):
+            t = self._tracks[ns]
+            if t.samples:
+                bits.append('%s min %.2f m (%d contact, %d near)'
+                            % (ns, t.min_gap, t.contacts, t.near_misses))
+        if bits:
+            rospy.loginfo('[CLEAR] %s', ' | '.join(bits))
+
+    def _final(self):
+        live = [t for t in self._tracks.values() if t.samples]
+        if not live:
+            return
+        contacts = sum(t.contacts for t in live)
+        near = sum(t.near_misses for t in live)
+        worst = min(t.min_gap for t in live)
+
+        say('')
+        say('%s  === clearance ================================================%s'
+            % (BOLD, OFF))
+        say('   solids in the city  : %d' % len(self._solids))
+        say('   contact threshold   : %.2f m (rotor tip), near miss %.2f m'
+            % (self._rotor, self._near))
+        for ns in sorted(self._tracks):
+            t = self._tracks[ns]
+            if not t.samples:
+                continue
+            col = RED if t.contacts else (AMBER if t.near_misses else GREEN)
+            where = ''
+            if t.min_at:
+                where = ' at (%.1f, %.1f, %.1f)' % t.min_at
+            say('   %-6s closest %s%.2f m%s%s  contacts %s%d%s  near %d'
+                % (t.ns, CYAN, t.min_gap, OFF, where,
+                   col, t.contacts, OFF, t.near_misses))
+        say('')
+        if contacts:
+            say('   %sFAILED: %d contact(s) - an aircraft was inside its own '
+                'rotor radius of a solid%s' % (RED, contacts, OFF))
+        elif near:
+            say('   %sno contacts, but %d near miss(es) under %.2f m - the '
+                'margins are thin%s' % (AMBER, near, self._near, OFF))
+        else:
+            say('   %sno contacts and no near misses; worst gap %.2f m%s'
+                % (GREEN, worst, OFF))
+        say('')
+
+
+def main():
+    ClearanceMonitor()
+    rospy.spin()
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,162 @@
+<?xml version="1.0"?>
+<!-- One courier: the airframe, the controller, a monitor.
+
+     Included three times by delivery.launch with a different ns and start
+     position. The parcel book is not here - the dispatcher is started once by
+     the parent launch, outside every namespace, because a parcel can be given
+     to any aircraft and something has to hold the whole board.
+
+     Everything here is inside the caller's <group ns="...">, so every topic,
+     service and parameter is namespaced by construction: /uav_0/cmd_vel,
+     /uav_0/engage, /uav_0/scan, /uav_0/delivery/task. hector's plugins take
+     the namespace from the enclosing group without being told, which is what
+     makes three of them in one Gazebo possible at all.
+
+     The gripper is the exception and is deliberately NOT namespaced:
+     /link_attacher_node/attach is a single world plugin shared by every drone,
+     and the courier addresses itself by its Gazebo model name - which is the
+     namespace - when it asks for a weld. -->
+<launch>
+  <arg name="ns" doc="Namespace and Gazebo model name, e.g. uav_0" />
+  <arg name="x" default="0.0" />
+  <arg name="y" default="0.0" />
+  <arg name="z" default="0.3" />
+
+  <arg name="cruise_altitude" />
+  <arg name="linear_speed" />
+  <arg name="angular_gain" />
+  <arg name="avoid_dist" />
+  <arg name="stop_dist" />
+  <arg name="arrive_radius" />
+  <arg name="grasp_reach" />
+  <arg name="box_size" />
+  <arg name="fleet" doc="Every drone namespace, so this one can see traffic" />
+  <arg name="separation_xy" />
+  <arg name="separation_z" />
+  <arg name="yield_speed" />
+  <arg name="depot_guard_xy" />
+  <arg name="depot_guard_z" />
+
+  <!-- The airframe, its plugins and controller/twist, from hector's own spawn
+       launch with the model swapped for the courier variant in this package.
+       name and tf_prefix must both be the namespace, or the three drones
+       collide in Gazebo's model list and on TF - and the attacher, which is
+       told model_name_1 = the namespace, would weld boxes to the wrong one. -->
+  <include file="$(find hector_quadrotor_gazebo)/launch/spawn_quadrotor.launch">
+    <arg name="name"      value="$(arg ns)" />
+    <arg name="tf_prefix" value="$(arg ns)" />
+    <arg name="model"     value="$(find uav_delivery)/urdf/quadrotor_courier.gazebo.xacro" />
+    <arg name="x"         value="$(arg x)" />
+    <arg name="y"         value="$(arg y)" />
+    <arg name="z"         value="$(arg z)" />
+  </include>
+
+  <!-- Off, and in this scenario it is not close to optional. auto_engage cuts
+       the motors when it sees a commanded descent that is not being achieved,
+       which is landing detection - and a courier's descent ends 0.31 m off the
+       deck and holds there while a weld is made. The courier calls /engage
+       once instead, and /shutdown deliberately during a respawn. -->
+  <param name="controller/twist/auto_engage" value="false" type="bool" />
+
+  <node pkg="uav_delivery" type="pose_delivery_monitor" name="pose_delivery_monitor"
+        output="screen"
+        launch-prefix="bash -c 'sleep 12 &amp;&amp; exec &quot;$0&quot; &quot;$@&quot;' --">
+    <param name="pose_log_hz" value="0.25" />
+  </node>
+
+  <node pkg="uav_delivery" type="courier" name="courier"
+        output="screen"
+        launch-prefix="bash -c 'sleep 14 &amp;&amp; exec &quot;$0&quot; &quot;$@&quot;' --">
+    <param name="cruise_altitude" value="$(arg cruise_altitude)" />
+    <!-- Must match the gripper_joint offset in the urdf. The working altitude
+         the courier flies to is derived from this plus box_size, so a mismatch
+         here does not fail loudly - it just grasps above or below the box. -->
+    <param name="grasp_reach"     value="$(arg grasp_reach)" />
+    <param name="box_size"        value="$(arg box_size)" />
+    <!-- Below the 0.31 m working altitude, unlike every sibling package where
+         min_altitude was a floor the aircraft never approached. Here it is the
+         last thing between a descent and the ground, and it has to leave room
+         for the descent to actually finish. -->
+    <param name="min_altitude"    value="0.26" />
+    <param name="linear_speed"    value="$(arg linear_speed)" />
+    <param name="vertical_speed"  value="0.5" />
+    <param name="arrive_radius"   value="$(arg arrive_radius)" />
+    <param name="climb_tol"       value="0.20" />
+    <!-- Traffic. The laser sees another aircraft only when the two are at
+         much the same height, which is exactly not the case for the
+         encounters that matter - somebody descending onto a depot while
+         somebody else crosses above. So each courier is told who else is
+         flying and watches them directly; inside these two distances the one
+         without right of way stops and holds. -->
+    <rosparam param="fleet" subst_value="true">$(arg fleet)</rosparam>
+    <param name="separation_xy"   value="$(arg separation_xy)" />
+    <param name="separation_z"    value="$(arg separation_z)" />
+    <!-- Giving way means backing away, not stopping. Stopping sounds polite
+         and does not work: the aircraft with right of way is still flying, and
+         if its goal lies beyond the one that stopped it flies into it -
+         measured, a pair that yielded at 0.32 m closed to 0.08 m anyway. -->
+    <param name="yield_speed"     value="$(arg yield_speed)" />
+    <!-- Descents are serialised per depot. The layers separate transits
+         perfectly and then every one of them collapses onto the same descent,
+         which is where the conflicts actually were; a courier whose depot is
+         occupied queues on its own layer instead. -->
+    <param name="depot_guard_xy"  value="$(arg depot_guard_xy)" />
+    <param name="depot_guard_z"   value="$(arg depot_guard_z)" />
+    <!-- The weld is a fixed joint rather than a physical grip, so what the
+         approach actually has to guarantee is that the pad is over the box -
+         the pad is 0.09 m across and the box 0.10, giving about 0.09 m of
+         genuine slack. 0.06 keeps a healthy margin inside that while being
+         loose enough that station-keeping can actually hold it: measured at 10
+         to 40 mm in the sibling package, and the delivery leg flies it with
+         unmodelled payload inertia. -->
+    <param name="grasp_tolerance" value="0.060" />
+    <param name="grasp_z_tol"     value="0.030" />
+    <!-- Held this far above the box while centring. It must be a commanded
+         altitude and not a commanded zero rate: controller/twist closes on
+         velocity, so zero is "stop climbing" and the aircraft sinks about a
+         centimetre a second out of its own grasp window. -->
+    <param name="hover_margin"    value="0.20" />
+    <!-- A descent that will not converge has to end, or the parcel stays
+         claimed forever and no other aircraft is ever offered it. -->
+    <param name="act_timeout"     value="40.0" />
+    <!-- Gentle on purpose: this is the one phase that commands lateral
+         velocity, and a drone that darts sideways at 0.3 m with a box slung
+         underneath is a drone about to be respawned. -->
+    <param name="station_gain"    value="1.2" />
+    <param name="station_speed"   value="0.5" />
+    <param name="angular_gain"    value="$(arg angular_gain)" />
+    <param name="max_angular"     value="1.5" />
+    <param name="angle_tol"       value="0.12" />
+    <param name="slow_dist"       value="1.2" />
+    <param name="avoid_dist"      value="$(arg avoid_dist)" />
+    <param name="stop_dist"       value="$(arg stop_dist)" />
+    <!-- The scan is trusted down to the sensor's own floor, because a crate
+         the drone is already touching reads at 0.33 m and must not be filtered
+         away. Self-hits off the rotors are rejected by tilt instead: past
+         self_hit_tilt the mast no longer holds the scan plane above the rotor
+         discs, and only then is anything inside self_hit_range dropped. -->
+    <param name="min_valid_range" value="0.15" />
+    <param name="self_hit_range"  value="0.50" />
+    <param name="self_hit_tilt"   value="0.50" />
+    <param name="back_off_speed"  value="0.35" />
+    <!-- Commit to a deflection for a moment after the front sector clears.
+         Without it the drone re-aims the instant it is past, turns back into
+         the crate and never gets by - see the courier's CHASE branch. -->
+    <param name="avoid_hold"      value="1.5" />
+    <!-- Geofence, sized to the 32 x 32 m yard. Soft at 14.5 turns the drone
+         round with 1.4 m still between it and the wall face at 15.9; past the
+         hard limit, or tilted past upset_angle, it is respawned at its launch
+         point. Necessary because auto_engage:=false above also disables
+         hector's flip-over motor cut. -->
+    <param name="fence_half_size" value="14.5" />
+    <param name="fence_hard_size" value="20.0" />
+    <param name="fence_max_alt"   value="4.0" />
+    <param name="upset_angle"     value="1.05" />
+    <param name="settle_time"     value="1.5" />
+    <param name="start_x"         value="$(arg x)" />
+    <param name="start_y"         value="$(arg y)" />
+    <param name="control_hz"      value="20.0" />
+    <param name="status_hz"       value="1.0" />
+  </node>
+
+</launch>
